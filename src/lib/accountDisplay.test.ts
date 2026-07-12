@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AccountWithUsage } from "../types";
-import { needsAttention } from "./accountDisplay";
+import { formatPlanLabel, needsAttention } from "./accountDisplay";
 
 function makeAccount(overrides: Partial<AccountWithUsage> = {}): AccountWithUsage {
   return {
@@ -32,6 +32,16 @@ function makeAccount(overrides: Partial<AccountWithUsage> = {}): AccountWithUsag
 }
 
 describe("accountDisplay", () => {
+  it("uses an honest unknown label when ChatGPT returns no plan", () => {
+    expect(formatPlanLabel({ plan_type: null, auth_mode: "chat_gpt" })).toBe("Unknown");
+  });
+
+  it("formats live multi-word plan identifiers", () => {
+    expect(formatPlanLabel({ plan_type: "chatgpt_team", auth_mode: "chat_gpt" })).toBe(
+      "ChatGPT Team"
+    );
+  });
+
   it("does not flag expected API-key no-usage state as needing attention", () => {
     expect(needsAttention(makeAccount())).toBe(false);
   });

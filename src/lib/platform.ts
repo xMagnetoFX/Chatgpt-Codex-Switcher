@@ -65,7 +65,7 @@ export async function exportFullBackupFile(): Promise<boolean> {
     const selected = await save({
       title: "Export Full Encrypted Account Config",
       defaultPath: "codex-switcher-full.cswf",
-      filters: [{ name: "Codex Switcher Full Backup", extensions: ["cswf"] }],
+      filters: [{ name: "ChatGPT Codex Switcher Full Backup", extensions: ["cswf"] }],
     });
 
     if (!selected) return false;
@@ -84,7 +84,7 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
     const selected = await open({
       multiple: false,
       title: "Import Full Encrypted Account Config",
-      filters: [{ name: "Codex Switcher Full Backup", extensions: ["cswf"] }],
+      filters: [{ name: "ChatGPT Codex Switcher Full Backup", extensions: ["cswf"] }],
     });
 
     if (!selected || Array.isArray(selected)) return null;

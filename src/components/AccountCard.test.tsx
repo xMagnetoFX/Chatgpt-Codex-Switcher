@@ -43,20 +43,33 @@ function renderCard(overrides: Partial<ComponentProps<typeof AccountCard>> = {})
 }
 
 describe("AccountCard", () => {
-  it("masks names, emails, and initials without rendering the raw identity", () => {
-    renderCard({ masked: true });
+  it("masks names and emails while keeping the user avatar decorative", () => {
+    const { container } = renderCard({ masked: true });
 
     expect(screen.queryByText("AC3 Private")).not.toBeInTheDocument();
     expect(screen.queryByText("private@example.com")).not.toBeInTheDocument();
     expect(screen.getByText("Hidden account")).toBeInTheDocument();
     expect(screen.getByText("Hidden email")).toBeInTheDocument();
-    expect(screen.getByText("**")).toHaveAttribute("aria-label", "account initials hidden");
+    expect(container.querySelector(".avatar-sm")).toHaveAttribute("aria-hidden", "true");
   });
 
   it("offers restart switching while Codex processes are running", () => {
     renderCard({ switchDisabled: true });
 
     expect(screen.getByRole("button", { name: "Restart & switch" })).toBeEnabled();
+  });
+
+  it("prefers the live usage plan over stale stored plan metadata", () => {
+    renderCard({
+      account: {
+        ...baseAccount,
+        plan_type: "plus",
+        usage: { ...baseAccount.usage!, plan_type: "pro" },
+      },
+    });
+
+    expect(screen.getByText("Pro")).toBeInTheDocument();
+    expect(screen.queryByText("Plus")).not.toBeInTheDocument();
   });
 
   it("locks switching while Codex runs when restart switching is disabled", () => {

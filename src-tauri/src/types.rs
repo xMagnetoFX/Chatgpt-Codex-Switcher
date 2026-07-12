@@ -1,4 +1,4 @@
-//! Core types for Codex Switcher
+//! Core types for ChatGPT Codex Switcher
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

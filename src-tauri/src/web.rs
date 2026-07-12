@@ -20,7 +20,7 @@ use crate::commands::{
     set_masked_account_ids, start_login, switch_account, warmup_account, warmup_all_accounts,
 };
 
-const BASIC_AUTH_REALM: &str = "Codex Switcher";
+const BASIC_AUTH_REALM: &str = "ChatGPT Codex Switcher";
 const BASIC_AUTH_USERNAME: &str = "codex";
 const MAX_WEB_REQUEST_BODY_BYTES: u64 = 12 * 1024 * 1024;
 const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'";
@@ -117,7 +117,7 @@ pub fn run_lan_server(host: &str, port: u16, security: WebServerSecurity) -> any
         .join("build")
         .join("web");
 
-    println!("Codex Switcher web server listening on http://{address}");
+    println!("ChatGPT Codex Switcher web server listening on http://{address}");
     println!("Serving static files from {}", dist_dir.display());
     if security.basic_auth_enabled() {
         println!("HTTP Basic auth enabled for all web requests. Username: {BASIC_AUTH_USERNAME}");

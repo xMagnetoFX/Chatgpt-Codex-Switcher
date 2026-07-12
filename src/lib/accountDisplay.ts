@@ -4,10 +4,19 @@ export function formatPlanLabel(
   account: Pick<AccountWithUsage, "plan_type" | "auth_mode">
 ): string {
   if (account.plan_type) {
-    return account.plan_type.charAt(0).toUpperCase() + account.plan_type.slice(1);
+    if (account.plan_type.toLowerCase() === "api_key") return "API Key";
+    return account.plan_type
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((part) =>
+        part.toLowerCase() === "chatgpt"
+          ? "ChatGPT"
+          : part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+      )
+      .join(" ");
   }
 
-  return account.auth_mode === "api_key" ? "API Key" : "ChatGPT";
+  return account.auth_mode === "api_key" ? "API Key" : "Unknown";
 }
 
 export function getLowestRemaining(usage?: UsageInfo): number | null {

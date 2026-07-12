@@ -101,7 +101,7 @@ export function UpdateChecker() {
       <div className="panel-surface rounded-[24px] p-4">
         {status.kind === "available" && (
           <div className="flex gap-3">
-            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[color:var(--accent-border)] bg-cyan-500/10 text-[color:var(--accent)]">
+            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[color:var(--accent-border)] bg-[color:var(--accent-soft)] text-[color:var(--accent)]">
               <ArrowUpIcon className="h-5 w-5" />
             </div>
             <div className="min-w-0 flex-1">
@@ -165,7 +165,7 @@ export function UpdateChecker() {
 
         {status.kind === "ready" && (
           <div className="flex gap-3">
-            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-emerald-400/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300">
+            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[color:var(--success-border)] bg-[color:var(--success-soft)] text-[color:var(--success)]">
               <CheckIcon className="h-5 w-5" />
             </div>
             <div className="min-w-0 flex-1">
@@ -195,12 +195,12 @@ export function UpdateChecker() {
 
         {status.kind === "error" && (
           <div className="flex gap-3">
-            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-300">
+            <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[color:var(--danger-border)] bg-[color:var(--danger-soft)] text-[color:var(--danger)]">
               <CloseIcon className="h-5 w-5" />
             </div>
             <div className="min-w-0 flex-1">
               <div className="section-kicker">Updater error</div>
-              <p className="mt-2 text-sm leading-6 text-red-700 dark:text-red-200">
+              <p className="mt-2 text-sm leading-6 text-[color:var(--danger)]">
                 {status.message}
               </p>
               <button

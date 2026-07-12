@@ -34,6 +34,16 @@ function formatWindowDuration(minutes: number | null | undefined): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+function formatLimitLabel(
+  fallbackLabel: string,
+  windowMinutes: number | null | undefined
+): string {
+  if (!windowMinutes) return fallbackLabel;
+  if (windowMinutes === 5 * 60) return "5h limit";
+  if (windowMinutes === 7 * 24 * 60) return "Weekly limit";
+  return `${formatWindowDuration(windowMinutes)} limit`;
+}
+
 function RateLimitBar({
   label,
   usedPercent,
@@ -52,6 +62,7 @@ function RateLimitBar({
     "usage-fill";
 
   const windowLabel = formatWindowDuration(windowMinutes);
+  const displayLabel = formatLimitLabel(label, windowMinutes);
   const resetLabel = formatResetTime(resetsAt);
   const exactResetLabel = formatExactResetTime(resetsAt);
 
@@ -59,7 +70,7 @@ function RateLimitBar({
     <div className="usage-row">
       <div className="usage-row-head">
         <span className="usage-label">
-          {label}{windowLabel ? ` (${windowLabel})` : ""}
+          {displayLabel}{windowLabel ? ` (${windowLabel})` : ""}
         </span>
         <span className="usage-pct">
           {remainingPercent.toFixed(0)}%{" "}
@@ -116,10 +127,10 @@ export function UsageBar({ usage, loading }: UsageBarProps) {
         style={{
           padding: "10px 12px",
           borderRadius: 12,
-          border: "1px solid oklch(0.72 0.18 22 / 0.3)",
-          background: "oklch(0.72 0.18 22 / 0.1)",
+          border: "1px solid var(--danger-border)",
+          background: "var(--danger-soft)",
           fontSize: 12.5,
-          color: "oklch(0.72 0.18 22)",
+          color: "var(--danger)",
           lineHeight: 1.5,
         }}
       >

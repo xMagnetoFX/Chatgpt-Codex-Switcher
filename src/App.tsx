@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type MouseEvent } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import {
   AddAccountModal,
   AppShell,
@@ -27,6 +27,8 @@ const THEME_STORAGE_KEY = "codex-switcher-theme";
 const AUTO_WARMUP_STORAGE_KEY = "codex-switcher-auto-warmup";
 const RESTART_SWITCH_STORAGE_KEY = "codex-switcher-restart-switch";
 const AUTO_WARMUP_INTERVAL_MS = 60 * 60 * 1000;
+const MIN_WINDOW_WIDTH = 1290;
+const MIN_WINDOW_HEIGHT = 860;
 const isMacOs =
   typeof navigator !== "undefined" && /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent);
 type AppWindow = ReturnType<typeof getCurrentWindow>;
@@ -91,7 +93,7 @@ function App() {
   const [warmupToast, setWarmupToast] = useState<ToastState | null>(null);
   const [maskedAccounts, setMaskedAccounts] = useState<Set<string>>(new Set());
   const [otherAccountsSort, setOtherAccountsSort] = useState<SortMode>("deadline_asc");
-  const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
+  const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "light";
     try {
@@ -131,23 +133,22 @@ function App() {
 
   const handleTitlebarDrag = useCallback((event: MouseEvent<HTMLDivElement>) => {
     const appWindow = getAppWindow();
-    if (!appWindow || event.button !== 0 || isWindowFullscreen) return;
+    if (!appWindow || event.button !== 0 || event.detail > 1) return;
     void appWindow.startDragging();
-  }, [isWindowFullscreen]);
+  }, []);
 
-  const toggleFullscreenMode = useCallback(() => {
+  const toggleMaximizeMode = useCallback(() => {
     const appWindow = getAppWindow();
     if (!appWindow) return;
-    const next = !isWindowFullscreen;
     void appWindow
-      .setFullscreen(next)
-      .then(() => setIsWindowFullscreen(next))
-      .catch((err) => { console.error("Failed to toggle fullscreen:", err); });
-  }, [isWindowFullscreen]);
+      .toggleMaximize()
+      .then(async () => setIsWindowMaximized(await appWindow.isMaximized()))
+      .catch((err) => { console.error("Failed to toggle maximize:", err); });
+  }, []);
 
   const handleTitlebarDoubleClick = useCallback(() => {
-    toggleFullscreenMode();
-  }, [toggleFullscreenMode]);
+    toggleMaximizeMode();
+  }, [toggleMaximizeMode]);
 
   const checkProcesses = useCallback(async (): Promise<CodexProcessInfo | null> => {
     try {
@@ -230,19 +231,37 @@ function App() {
 
     let unlisten: (() => void) | undefined;
 
-    const syncFullscreen = async () => {
+    const syncMaximized = async () => {
       try {
-        const fullscreen = await appWindow.isFullscreen();
-        setIsWindowFullscreen(fullscreen);
+        const maximized = await appWindow.isMaximized();
+        setIsWindowMaximized(maximized);
       } catch (err) {
         console.error("Failed to read window state:", err);
       }
     };
 
-    void syncFullscreen();
+    const enforceMinimumWindowSize = async () => {
+      try {
+        const [physicalSize, scaleFactor] = await Promise.all([
+          appWindow.innerSize(),
+          appWindow.scaleFactor(),
+        ]);
+        const logicalSize = physicalSize.toLogical(scaleFactor);
+        const width = Math.max(logicalSize.width, MIN_WINDOW_WIDTH);
+        const height = Math.max(logicalSize.height, MIN_WINDOW_HEIGHT);
+        if (width !== logicalSize.width || height !== logicalSize.height) {
+          await appWindow.setSize(new LogicalSize(width, height));
+        }
+      } catch (err) {
+        console.error("Failed to enforce minimum window size:", err);
+      }
+    };
+
+    void syncMaximized();
+    void enforceMinimumWindowSize();
 
     appWindow
-      .onResized(() => { void syncFullscreen(); })
+      .onResized(() => { void syncMaximized(); })
       .then((fn) => { unlisten = fn; })
       .catch((err) => { console.error("Failed to watch window resize:", err); });
 
@@ -561,13 +580,13 @@ function App() {
     <>
       <AppShell
         isMacOs={isMacOs}
-        isWindowFullscreen={isWindowFullscreen}
+        isWindowMaximized={isWindowMaximized}
         onTitlebarDrag={handleTitlebarDrag}
         onTitlebarDoubleClick={handleTitlebarDoubleClick}
         onMinimize={() => {
           void getAppWindow()?.minimize();
         }}
-        onToggleFullscreen={toggleFullscreenMode}
+        onToggleMaximize={toggleMaximizeMode}
         onClose={() => {
           void getAppWindow()?.close();
         }}
@@ -608,7 +627,7 @@ function App() {
             attentionCount={attentionCount}
             switchingId={switchingId}
             isRefreshing={isRefreshing}
-            isWindowMaximized={isWindowFullscreen}
+            isWindowMaximized={isWindowMaximized}
             allMasked={allMasked}
             restartSwitchEnabled={restartSwitchEnabled}
             maskedAccounts={maskedAccounts}

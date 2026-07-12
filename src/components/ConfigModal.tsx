@@ -55,10 +55,10 @@ export function ConfigModal({
               style={{
                 padding: "10px 14px",
                 borderRadius: 12,
-                border: "1px solid oklch(0.82 0.16 75 / 0.3)",
-                background: "oklch(0.82 0.16 75 / 0.1)",
+                border: "1px solid var(--warning-border)",
+                background: "var(--warning-soft)",
                 fontSize: 12.5,
-                color: "oklch(0.74 0.18 75)",
+                color: "var(--warning)",
                 lineHeight: 1.5,
               }}
             >
@@ -99,10 +99,10 @@ export function ConfigModal({
               style={{
                 padding: "10px 14px",
                 borderRadius: 12,
-                border: "1px solid oklch(0.72 0.18 22 / 0.3)",
-                background: "oklch(0.72 0.18 22 / 0.1)",
+                border: "1px solid var(--danger-border)",
+                background: "var(--danger-soft)",
                 fontSize: 12.5,
-                color: "oklch(0.72 0.18 22)",
+                color: "var(--danger)",
                 lineHeight: 1.5,
               }}
             >

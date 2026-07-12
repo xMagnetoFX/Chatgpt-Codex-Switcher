@@ -240,10 +240,10 @@ export function AddAccountModal({
               style={{
                 padding: "10px 14px",
                 borderRadius: 12,
-                border: "1px solid oklch(0.72 0.18 22 / 0.3)",
-                background: "oklch(0.72 0.18 22 / 0.1)",
+                border: "1px solid var(--danger-border)",
+                background: "var(--danger-soft)",
                 fontSize: 12.5,
-                color: "oklch(0.72 0.18 22)",
+                color: "var(--danger)",
                 lineHeight: 1.5,
               }}
             >

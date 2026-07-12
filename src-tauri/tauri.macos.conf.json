@@ -3,7 +3,7 @@
   "app": {
     "windows": [
       {
-        "title": "Codex Switcher",
+        "title": "ChatGPT Codex Switcher",
         "width": 1280,
         "height": 860,
         "center": true,

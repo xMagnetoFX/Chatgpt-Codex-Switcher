@@ -33,33 +33,36 @@ export function Sidebar({
             />
           </div>
           <div className="brand-text">
-            <h1>Codex Switcher</h1>
+            <h1 aria-label="ChatGPT Codex Switcher">
+              <span className="brand-chatgpt">ChatGPT</span>{" "}
+              <span className="brand-codex">Codex</span>
+            </h1>
+            <span className="brand-product-type">Switcher</span>
             <p>Account switching, usage checks, and backups.</p>
           </div>
         </div>
-        <div className="brand-sep" />
         <div className="brand-activity">
-          <div className="flex items-center justify-between">
+          <div className="brand-activity-content">
             <span className="kicker-faint">Codex activity</span>
-            {processInfo && (
-              <span
-                className="live-dot"
-                style={{ background: hasRunningProcesses ? "var(--warning)" : "var(--accent)" }}
-              />
-            )}
+            <div className="flex items-baseline gap-2">
+              <span className="processes-num">
+                {processInfo ? processInfo.count : "—"}
+              </span>
+              <span className="text-[11.5px] text-[color:var(--text-muted)]">
+                {processInfo
+                  ? hasRunningProcesses
+                    ? `process${processInfo.count === 1 ? "" : "es"} running`
+                    : "no active processes"
+                  : "checking…"}
+              </span>
+            </div>
           </div>
-          <div className="flex items-baseline gap-2">
-            <span className="processes-num">
-              {processInfo ? processInfo.count : "—"}
-            </span>
-            <span className="text-[11.5px] text-[color:var(--text-muted)]">
-              {processInfo
-                ? hasRunningProcesses
-                  ? `process${processInfo.count === 1 ? "" : "es"} running`
-                  : "no active processes"
-                : "checking…"}
-            </span>
-          </div>
+          {processInfo && (
+            <span
+              className="live-dot brand-activity-dot"
+              style={{ background: hasRunningProcesses ? "var(--warning)" : "var(--accent)" }}
+            />
+          )}
         </div>
       </div>
 

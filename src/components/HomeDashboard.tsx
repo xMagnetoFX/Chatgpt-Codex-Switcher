@@ -1,6 +1,15 @@
 import type { AccountWithUsage, CodexProcessInfo } from "../types";
 import type { SortMode } from "../types/ui";
-import { ChevronDownIcon, EyeIcon, EyeOffIcon, RefreshIcon } from "./icons";
+import {
+  AccountsIcon,
+  ChevronDownIcon,
+  EyeIcon,
+  EyeOffIcon,
+  PersonIcon,
+  RefreshIcon,
+  SwitchIcon,
+  WarningIcon,
+} from "./icons";
 import { AccountCard } from "./AccountCard";
 import { StatePanel } from "./ui";
 
@@ -113,7 +122,7 @@ export function HomeDashboard({
               margin: 0,
               fontSize: 26,
               fontWeight: 600,
-              letterSpacing: "-0.035em",
+              letterSpacing: "-0.01em",
               color: "var(--text-strong)",
             }}
           >
@@ -133,7 +142,7 @@ export function HomeDashboard({
             className="icon-btn-lg"
           >
             {allMasked ? <EyeIcon className="h-4 w-4" /> : <EyeOffIcon className="h-4 w-4" />}
-            <span className="hidden xl:inline">{allMasked ? "Reveal" : "Hide"}</span>
+            <span className="hidden lg:inline">{allMasked ? "Reveal" : "Hide"}</span>
           </button>
           <button
             type="button"
@@ -144,7 +153,7 @@ export function HomeDashboard({
             className="icon-btn-lg"
           >
             <RefreshIcon className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
-            <span className="hidden xl:inline">{isRefreshing ? "Refreshing" : "Refresh"}</span>
+            <span className="hidden lg:inline">{isRefreshing ? "Refreshing" : "Refresh"}</span>
           </button>
         </div>
       </div>
@@ -152,12 +161,22 @@ export function HomeDashboard({
       {/* Metric tiles */}
       <div className="metrics">
         <div className="metric">
-          <div className="metric-label">Total accounts</div>
+          <div className="metric-head">
+            <div className="metric-label">Total accounts</div>
+            <span className="metric-icon" aria-hidden="true">
+              <AccountsIcon />
+            </span>
+          </div>
           <div className="metric-value">{accounts.length}</div>
           <div className="metric-note">stored in your local switcher workspace</div>
         </div>
-        <div className="metric">
-          <div className="metric-label">Active account</div>
+        <div className="metric metric-active">
+          <div className="metric-head">
+            <div className="metric-label">Active account</div>
+            <span className="metric-icon" aria-hidden="true">
+              <PersonIcon />
+            </span>
+          </div>
           <div className="metric-value">
             {activeAccount ? (activeAccountMasked ? "Hidden" : activeAccount.name) : "None"}
           </div>
@@ -171,8 +190,13 @@ export function HomeDashboard({
                   : "select an account to activate"}
           </div>
         </div>
-        <div className="metric">
-          <div className="metric-label">Switch status</div>
+        <div className={`metric ${hasRunningProcesses ? "metric-caution" : "metric-ready"}`}>
+          <div className="metric-head">
+            <div className="metric-label">Switch status</div>
+            <span className="metric-icon" aria-hidden="true">
+              <SwitchIcon />
+            </span>
+          </div>
           <div className="metric-value">
             {processInfo
               ? hasRunningProcesses
@@ -190,8 +214,13 @@ export function HomeDashboard({
               : "querying live process state"}
           </div>
         </div>
-        <div className="metric">
-          <div className="metric-label">Attention</div>
+        <div className={`metric ${attentionCount > 0 ? "metric-caution" : "metric-clear"}`}>
+          <div className="metric-head">
+            <div className="metric-label">Attention</div>
+            <span className="metric-icon" aria-hidden="true">
+              <WarningIcon />
+            </span>
+          </div>
           <div className="metric-value">{attentionCount > 0 ? attentionCount : "Clear"}</div>
           <div className="metric-note">
             {attentionCount > 0

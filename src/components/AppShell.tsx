@@ -8,33 +8,33 @@ import {
 
 interface AppShellProps {
   isMacOs: boolean;
-  isWindowFullscreen: boolean;
+  isWindowMaximized: boolean;
   sidebar: ReactNode;
   topBar: ReactNode;
   children: ReactNode;
   onTitlebarDrag: (event: MouseEvent<HTMLDivElement>) => void;
   onTitlebarDoubleClick: () => void;
   onMinimize: () => void;
-  onToggleFullscreen: () => void;
+  onToggleMaximize: () => void;
   onClose: () => void;
 }
 
 export function AppShell({
   isMacOs,
-  isWindowFullscreen,
+  isWindowMaximized,
   sidebar,
   topBar,
   children,
   onTitlebarDrag,
   onTitlebarDoubleClick,
   onMinimize,
-  onToggleFullscreen,
+  onToggleMaximize,
   onClose,
 }: AppShellProps) {
   return (
     <div
       className={`h-dvh overflow-hidden text-[color:var(--text-strong)] ${
-        isWindowFullscreen ? "app-shell-fullscreen" : ""
+        isWindowMaximized ? "app-shell-maximized" : ""
       }`}
     >
       <div className="app-backdrop flex h-full min-h-0 flex-col overflow-hidden">
@@ -42,9 +42,10 @@ export function AppShell({
           <div
             onMouseDown={onTitlebarDrag}
             onDoubleClick={onTitlebarDoubleClick}
+            data-testid="window-drag-region"
             className={`h-full flex-1 select-none cursor-default ${isMacOs ? "ml-18" : ""}`}
           />
-          <span className="app-titlebar-label">Codex Switcher</span>
+          <span className="app-titlebar-label">ChatGPT Codex Switcher</span>
           {!isMacOs && (
             <div className="window-controls ml-3 flex h-full items-stretch">
               <button
@@ -58,12 +59,12 @@ export function AppShell({
               </button>
               <button
                 type="button"
-                onClick={onToggleFullscreen}
+                onClick={onToggleMaximize}
                 className="titlebar-button"
-                title={isWindowFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-                aria-label={isWindowFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                title={isWindowMaximized ? "Restore" : "Maximize"}
+                aria-label={isWindowMaximized ? "Restore" : "Maximize"}
               >
-                {isWindowFullscreen ? (
+                {isWindowMaximized ? (
                   <WindowRestoreIcon className="h-8 w-[46px]" />
                 ) : (
                   <WindowMaximizeIcon className="h-8 w-[46px]" />

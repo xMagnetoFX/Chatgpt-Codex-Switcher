@@ -1,8 +1,9 @@
 //! Usage query Tauri commands
 
 use crate::api::usage::{get_account_usage, refresh_all_usage, warmup_account as send_warmup};
+use crate::auth::storage::update_account_metadata;
 use crate::auth::{get_account, load_accounts};
-use crate::types::{UsageInfo, WarmupSummary};
+use crate::types::{StoredAccount, UsageInfo, WarmupSummary};
 use futures::{stream, StreamExt};
 
 /// Get usage info for a specific account
@@ -12,14 +13,56 @@ pub async fn get_usage(account_id: String) -> Result<UsageInfo, String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Account not found: {account_id}"))?;
 
-    get_account_usage(&account).await.map_err(|e| e.to_string())
+    let usage = get_account_usage(&account)
+        .await
+        .map_err(|e| e.to_string())?;
+    persist_live_plan_type(&account, &usage);
+    Ok(usage)
 }
 
 /// Refresh usage info for all accounts
 #[tauri::command]
 pub async fn refresh_all_accounts_usage() -> Result<Vec<UsageInfo>, String> {
     let store = load_accounts().map_err(|e| e.to_string())?;
-    Ok(refresh_all_usage(&store.accounts).await)
+    let usage_results = refresh_all_usage(&store.accounts).await;
+    for usage in &usage_results {
+        if let Some(account) = store
+            .accounts
+            .iter()
+            .find(|account| account.id == usage.account_id)
+        {
+            persist_live_plan_type(account, usage);
+        }
+    }
+    Ok(usage_results)
+}
+
+fn persist_live_plan_type(account: &StoredAccount, usage: &UsageInfo) {
+    if usage.error.is_some() {
+        return;
+    }
+
+    let Some(plan_type) = usage
+        .plan_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty())
+    else {
+        return;
+    };
+
+    if account.plan_type.as_deref() == Some(plan_type) {
+        return;
+    }
+
+    if let Err(error) =
+        update_account_metadata(&account.id, None, None, Some(plan_type.to_string()))
+    {
+        eprintln!(
+            "[Usage] Failed to persist live plan type for {}: {error}",
+            account.name
+        );
+    }
 }
 
 /// Send a minimal warm-up request for one account

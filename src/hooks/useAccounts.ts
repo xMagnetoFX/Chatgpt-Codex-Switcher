@@ -8,6 +8,12 @@ import type {
 } from "../types";
 import { invokeBackend, type FileSource } from "../lib/platform";
 
+function resolvePlanType(usage: UsageInfo, fallback: string | null): string | null {
+  if (usage.error) return fallback;
+  const livePlanType = usage.plan_type?.trim();
+  return livePlanType || fallback;
+}
+
 export function useAccounts() {
   const [accounts, setAccounts] = useState<AccountWithUsage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -128,6 +134,7 @@ export function useAccounts() {
             if (!usage) return account;
             return {
               ...account,
+              plan_type: resolvePlanType(usage, account.plan_type),
               usage,
               usageLoading: false,
             };
@@ -148,7 +155,16 @@ export function useAccounts() {
       );
       const usage = await invokeBackend<UsageInfo>("get_usage", { accountId });
       setAccounts((prev) =>
-        prev.map((a) => (a.id === accountId ? { ...a, usage, usageLoading: false } : a))
+        prev.map((a) =>
+          a.id === accountId
+            ? {
+                ...a,
+                plan_type: resolvePlanType(usage, a.plan_type),
+                usage,
+                usageLoading: false,
+              }
+            : a
+        )
       );
     } catch (err) {
       console.error("Failed to refresh single usage:", err);

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AccountWithUsage } from "../types";
-import { formatPlanLabel, getAccountInitials, getPrivatePlaceholder } from "../lib/accountDisplay";
-import { TrashIcon } from "./icons";
+import { formatPlanLabel, getPrivatePlaceholder } from "../lib/accountDisplay";
+import { PersonIcon, TrashIcon } from "./icons";
 import { UsageBar } from "./UsageBar";
 
 interface AccountCardProps {
@@ -45,12 +45,13 @@ function PrivateText({
 }
 
 const planChipClass: Record<string, string> = {
-  pro:        "plan-chip plan-chip--pro",
-  plus:       "plan-chip plan-chip--plus",
-  team:       "plan-chip plan-chip--team",
+  pro: "plan-chip plan-chip--pro",
+  plus: "plan-chip plan-chip--plus",
+  team: "plan-chip plan-chip--team",
   enterprise: "plan-chip plan-chip--enterprise",
-  free:       "plan-chip plan-chip--free",
-  api_key:    "plan-chip plan-chip--api",
+  free: "plan-chip plan-chip--free",
+  api_key: "plan-chip plan-chip--api",
+  unknown: "plan-chip plan-chip--unknown",
 };
 
 export function AccountCard({
@@ -72,9 +73,13 @@ export function AccountCard({
   const inputRef = useRef<HTMLInputElement>(null);
   const isFeatured = featured || account.is_active;
 
-  useEffect(() => { setEditName(account.name); }, [account.name]);
+  useEffect(() => {
+    setEditName(account.name);
+  }, [account.name]);
 
-  useEffect(() => { setLastRefresh(null); }, [account.id]);
+  useEffect(() => {
+    setLastRefresh(null);
+  }, [account.id]);
 
   useEffect(() => {
     if (account.usage && !account.usage.error) setLastRefresh(new Date());
@@ -90,7 +95,11 @@ export function AccountCard({
   const handleRename = async () => {
     const trimmed = editName.trim();
     if (trimmed && trimmed !== account.name) {
-      try { await onRename(trimmed); } catch { setEditName(account.name); }
+      try {
+        await onRename(trimmed);
+      } catch {
+        setEditName(account.name);
+      }
     } else {
       setEditName(account.name);
     }
@@ -99,10 +108,17 @@ export function AccountCard({
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === "Enter") void handleRename();
-    else if (event.key === "Escape") { setEditName(account.name); setIsEditing(false); }
+    else if (event.key === "Escape") {
+      setEditName(account.name);
+      setIsEditing(false);
+    }
   };
 
-  const planKey = account.plan_type?.toLowerCase() || "api_key";
+  const livePlanType = account.usage?.error ? null : account.usage?.plan_type?.trim();
+  const resolvedPlanType = livePlanType || account.plan_type;
+  const planKey =
+    resolvedPlanType?.toLowerCase() || (account.auth_mode === "api_key" ? "api_key" : "unknown");
+  const planLabel = formatPlanLabel({ ...account, plan_type: resolvedPlanType });
   const chipClass = planChipClass[planKey] ?? planChipClass.free;
   const switchIsLocked = Boolean(switchDisabled && !restartSwitchEnabled);
 
@@ -117,8 +133,8 @@ export function AccountCard({
           </div>
 
           <div className="acct-identity">
-            <div className={`acct-avatar ${account.is_active ? "tinted" : ""}`} aria-label={masked ? "account initials hidden" : undefined}>
-              {getAccountInitials(account.name, masked)}
+            <div className={`acct-avatar ${account.is_active ? "tinted" : ""}`} aria-hidden="true">
+              <PersonIcon className="account-avatar-glyph" />
             </div>
             <div className="acct-meta min-w-0">
               {isEditing ? (
@@ -135,34 +151,39 @@ export function AccountCard({
               ) : (
                 <button
                   type="button"
-                  onClick={() => { if (!masked) { setEditName(account.name); setIsEditing(true); } }}
+                  onClick={() => {
+                    if (!masked) {
+                      setEditName(account.name);
+                      setIsEditing(true);
+                    }
+                  }}
                   className="text-left w-full"
                   title={masked ? undefined : "Click to rename"}
                 >
                   <div className="acct-name">
-                    <PrivateText masked={masked} kind="name">{account.name}</PrivateText>
+                    <PrivateText masked={masked} kind="name">
+                      {account.name}
+                    </PrivateText>
                   </div>
                 </button>
               )}
               {account.email && (
                 <div className="acct-email">
-                  <PrivateText masked={masked} kind="email">{account.email}</PrivateText>
+                  <PrivateText masked={masked} kind="email">
+                    {account.email}
+                  </PrivateText>
                 </div>
               )}
             </div>
           </div>
 
           <div className="plan-row">
-            <span className={chipClass}>{formatPlanLabel(account)}</span>
+            <span className={chipClass}>{planLabel}</span>
           </div>
 
           <div className="featured-cta">
             {account.is_active ? (
-              <button
-                type="button"
-                disabled
-                className="btn-ghost flex-1"
-              >
+              <button type="button" disabled className="btn-ghost flex-1">
                 Current account
               </button>
             ) : (
@@ -172,7 +193,13 @@ export function AccountCard({
                 disabled={switching || switchIsLocked}
                 className="btn-primary flex-1"
               >
-                {switching ? "Switching…" : switchDisabled ? (restartSwitchEnabled ? "Restart & switch" : "Codex running") : "Switch"}
+                {switching
+                  ? "Switching…"
+                  : switchDisabled
+                    ? restartSwitchEnabled
+                      ? "Restart & switch"
+                      : "Codex running"
+                    : "Switch"}
               </button>
             )}
             <button
@@ -199,8 +226,8 @@ export function AccountCard({
     <article className="acct-card">
       <div className="acct-card-top">
         <div className="acct-card-identity min-w-0 flex-1">
-          <div className="avatar-sm" aria-label={masked ? "account initials hidden" : undefined}>
-            {getAccountInitials(account.name, masked)}
+          <div className="avatar-sm" aria-hidden="true">
+            <PersonIcon className="account-avatar-glyph" />
           </div>
           <div className="min-w-0 flex-1">
             {isEditing ? (
@@ -217,23 +244,32 @@ export function AccountCard({
             ) : (
               <button
                 type="button"
-                onClick={() => { if (!masked) { setEditName(account.name); setIsEditing(true); } }}
+                onClick={() => {
+                  if (!masked) {
+                    setEditName(account.name);
+                    setIsEditing(true);
+                  }
+                }}
                 className="text-left min-w-0 w-full"
                 title={masked ? undefined : "Click to rename"}
               >
                 <div className="acct-card-name">
-                  <PrivateText masked={masked} kind="name">{account.name}</PrivateText>
+                  <PrivateText masked={masked} kind="name">
+                    {account.name}
+                  </PrivateText>
                 </div>
               </button>
             )}
             {account.email && (
               <div className="acct-card-email">
-                <PrivateText masked={masked} kind="email">{account.email}</PrivateText>
+                <PrivateText masked={masked} kind="email">
+                  {account.email}
+                </PrivateText>
               </div>
             )}
           </div>
         </div>
-        <span className={chipClass}>{formatPlanLabel(account)}</span>
+        <span className={chipClass}>{planLabel}</span>
       </div>
 
       <div className="usage-block">
@@ -267,7 +303,13 @@ export function AccountCard({
               : undefined
           }
         >
-          {switching ? "Switching…" : switchDisabled ? (restartSwitchEnabled ? "Restart & switch" : "Codex running") : "Switch"}
+          {switching
+            ? "Switching…"
+            : switchDisabled
+              ? restartSwitchEnabled
+                ? "Restart & switch"
+                : "Codex running"
+              : "Switch"}
         </button>
       </div>
     </article>

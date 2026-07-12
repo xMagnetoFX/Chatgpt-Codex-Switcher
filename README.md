@@ -1,32 +1,49 @@
-<p align="center">
-  <img src="src-tauri/icons/logo.svg" alt="Codex Switcher" width="120" height="120">
-</p>
+<div align="center">
+  <img src="src-tauri/icons/logo.svg" alt="ChatGPT Codex Switcher logo" width="120" height="120">
 
-# Codex Switcher
+  <h1>ChatGPT Codex Switcher</h1>
 
-A desktop-first account manager for Codex CLI users who work with multiple personal OpenAI or ChatGPT accounts.
+  <p><strong>A desktop-first account cockpit for Codex.</strong></p>
 
-Codex Switcher keeps account switching, usage checks, backups, privacy controls, and optional browser access in one focused app.
+  <p>
+    Switch personal OpenAI accounts safely, inspect live plan and usage data, protect identities,<br>
+    and keep recovery-ready backups from one focused native app.
+  </p>
 
-> Forked from [Lampese/codex-switcher](https://github.com/Lampese/codex-switcher). This project has left the fork network and now continues independently.
+  <p>
+    <img alt="App platforms" src="https://img.shields.io/badge/APP-WINDOWS%20%2B%20MACOS%20%2B%20LINUX-111827?style=flat-square">
+    <img alt="Tauri 2 runtime" src="https://img.shields.io/badge/RUNTIME-TAURI%202-24C8DB?style=flat-square">
+    <img alt="React 19 frontend" src="https://img.shields.io/badge/FRONTEND-REACT%2019-087EA4?style=flat-square">
+    <img alt="Rust backend" src="https://img.shields.io/badge/BACKEND-RUST-B7410E?style=flat-square">
+  </p>
+  <p>
+    <img alt="Live plan and usage data" src="https://img.shields.io/badge/USAGE-LIVE%20PLANS%20%2B%20LIMITS-60CDFF?style=flat-square">
+    <img alt="Encrypted backups" src="https://img.shields.io/badge/BACKUPS-ENCRYPTED%20.CSWF-7C3AED?style=flat-square">
+    <img alt="Active project" src="https://img.shields.io/badge/STATUS-ACTIVE-22C55E?style=flat-square">
+  </p>
 
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-1f6feb)
-![Runtime](https://img.shields.io/badge/runtime-Tauri%202-24c8db)
-![Frontend](https://img.shields.io/badge/frontend-React%2019-61dafb)
-![Backend](https://img.shields.io/badge/backend-Rust-b7410e)
-![Status](https://img.shields.io/badge/status-active-22c55e)
+  <p>
+    <a href="#interface-preview">Interface</a> ·
+    <a href="#feature-set">Features</a> ·
+    <a href="#architecture">Architecture</a> ·
+    <a href="#quick-start">Quick Start</a> ·
+    <a href="#browser-mode">Browser Mode</a> ·
+    <a href="#backups">Backups</a> ·
+    <a href="#development">Development</a> ·
+    <a href="#safety-notes">Safety</a>
+  </p>
+</div>
 
-Quick Start | Features | Browser Mode | Backups | Development | Safety Notes
-
-> The browser server binds to `127.0.0.1` by default. LAN access requires HTTP Basic auth.
+> [!NOTE]
+> Forked from [Lampese/codex-switcher](https://github.com/Lampese/codex-switcher), this project has left the fork network and now continues independently. Browser mode binds to `127.0.0.1` by default; LAN access requires HTTP Basic authentication.
 
 ## Interface Preview
 
-![Codex Switcher interface preview](docs/assets/interface-preview.png)
+![ChatGPT Codex Switcher interface preview](docs/assets/interface-preview.png)
 
-## Why Codex Switcher
+## Why ChatGPT Codex Switcher
 
-Codex Switcher is built for people who legitimately own multiple Codex-compatible accounts and want a safer way to move between them without manually editing `auth.json`.
+ChatGPT Codex Switcher is built for people who legitimately own multiple Codex-compatible accounts and want a safer way to move between them without manually editing `auth.json`.
 
 It gives you:
 
@@ -45,7 +62,7 @@ Switch the active Codex account from a desktop UI. The app updates the local Cod
 
 ### Restart Switching
 
-When enabled, Codex Switcher can close running Codex windows, switch accounts, and reopen the captured Codex process command.
+When enabled, ChatGPT Codex Switcher can close running Codex windows, switch accounts, and reopen the captured Codex process command.
 
 ### Usage Checks
 
@@ -76,7 +93,7 @@ Serve the same dashboard over HTTP for local browser testing, LAN access, Tailsc
 
 The desktop app and browser dashboard share the same Rust command layer, so account switching and backup behavior stay consistent across both surfaces.
 
-![Codex Switcher architecture](docs/assets/architecture.svg)
+![ChatGPT Codex Switcher architecture](docs/assets/architecture.svg)
 
 ## Quick Start
 
@@ -163,7 +180,7 @@ codex
 | Variable | Required | Description |
 | --- | --- | --- |
 | `CODEX_HOME` | No | Overrides the Codex config directory used for `auth.json` |
-| `CODEX_SWITCHER_CONFIG_DIR` | No | Overrides the Codex Switcher account store directory |
+| `CODEX_SWITCHER_CONFIG_DIR` | No | Overrides the ChatGPT Codex Switcher account store directory |
 | `CODEX_SWITCHER_WEB_HOST` | No | Browser server bind host, defaults to `127.0.0.1` |
 | `CODEX_SWITCHER_WEB_PORT` | No | Browser server port, defaults to `3210` |
 | `CODEX_SWITCHER_WEB_PASSWORD` | Required for non-loopback | Enables HTTP Basic auth for browser mode |
@@ -171,7 +188,7 @@ codex
 
 ## Backups
 
-Codex Switcher supports two backup paths.
+ChatGPT Codex Switcher supports two backup paths.
 
 | Format | Best For | Security Model |
 | --- | --- | --- |
@@ -184,7 +201,7 @@ Legacy `.cswf` backups using the older built-in passphrase format remain importa
 
 ## Process Safety
 
-Codex Switcher checks for running Codex app instances before switching accounts.
+ChatGPT Codex Switcher checks for running Codex app instances before switching accounts.
 
 Current behavior:
 
@@ -241,7 +258,7 @@ corepack pnpm release patch -- --push
 
 ## Safety Notes
 
-Codex Switcher is intended for accounts you personally own.
+ChatGPT Codex Switcher is intended for accounts you personally own.
 
 It is not intended for:
 
@@ -253,4 +270,4 @@ Slim exports contain account secrets. Treat them like credentials.
 
 ## Summary
 
-Codex Switcher is a focused desktop utility for managing multiple personal Codex accounts with safer switching, clear usage visibility, encrypted local backups, and an optional browser dashboard for controlled local or LAN access.
+ChatGPT Codex Switcher is a focused desktop utility for managing multiple personal Codex accounts with safer switching, clear usage visibility, encrypted local backups, and an optional browser dashboard for controlled local or LAN access.

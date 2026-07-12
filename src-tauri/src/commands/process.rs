@@ -210,7 +210,9 @@ fn find_active_codex_processes() -> anyhow::Result<(Vec<ActiveCodexProcess>, usi
 
                     // Skip our own app
                     let is_switcher =
-                        command.contains("codex-switcher") || command.contains("Codex Switcher");
+                        command.contains("codex-switcher")
+                            || command.contains("Codex Switcher")
+                            || command.contains("ChatGPT Codex Switcher");
 
                     if is_codex && !is_switcher {
                         if let Ok(pid) = pid_str.trim().parse::<u32>() {
@@ -252,12 +254,16 @@ fn find_windows_active_codex_processes() -> anyhow::Result<(Vec<ActiveCodexProce
     // the command line and only count live top-level app instances.
     const POWERSHELL_SCRIPT: &str = r#"
 $windowTitles = @{}
-Get-Process -Name Codex -ErrorAction SilentlyContinue | ForEach-Object {
+Get-Process -Name Codex,ChatGPT -ErrorAction SilentlyContinue | ForEach-Object {
   $windowTitles[[uint32]$_.Id] = $_.MainWindowTitle
 }
 
 Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -ieq 'Codex.exe' -or $_.Name -ieq 'codex.exe' } |
+  Where-Object {
+    $_.Name -ieq 'Codex.exe' -or
+    $_.Name -ieq 'codex.exe' -or
+    $_.Name -ieq 'ChatGPT.exe'
+  } |
   ForEach-Object {
     [PSCustomObject]@{
       Name = $_.Name
@@ -366,8 +372,18 @@ fn parse_windows_codex_processes(stdout: &str) -> anyhow::Result<Vec<WindowsCode
 fn is_windows_codex_root_process(process: &WindowsCodexProcess) -> bool {
     let name = process.name.to_ascii_lowercase();
     let command = process.command_line.to_ascii_lowercase();
+    let executable = process
+        .executable_path
+        .replace('\\', "/")
+        .to_ascii_lowercase();
 
-    name == "codex.exe"
+    // The Microsoft Store Codex package kept its OpenAI.Codex package identity but renamed
+    // the Electron host from Codex.exe to ChatGPT.exe in the 26.707 release. Restrict the
+    // ChatGPT name to that package path so a separately installed ChatGPT app is never stopped.
+    let is_codex_desktop_host = name == "codex.exe"
+        || (name == "chatgpt.exe" && executable.contains("/windowsapps/openai.codex_"));
+
+    is_codex_desktop_host
         && !command.contains("codex-switcher")
         && !command.contains("--type=")
         && !command.contains("resources\\codex.exe")
@@ -446,6 +462,10 @@ fn build_launch_spec(process: ActiveCodexProcess) -> anyhow::Result<CodexLaunchS
 }
 
 fn is_codex_executable(executable: &str) -> bool {
+    let normalized = executable
+        .trim_matches('"')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     let file_name = Path::new(executable)
         .file_name()
         .and_then(|value| value.to_str())
@@ -453,7 +473,9 @@ fn is_codex_executable(executable: &str) -> bool {
         .trim_matches('"')
         .to_ascii_lowercase();
 
-    file_name == "codex" || file_name == "codex.exe"
+    file_name == "codex"
+        || file_name == "codex.exe"
+        || (file_name == "chatgpt.exe" && normalized.contains("/windowsapps/openai.codex_"))
 }
 
 fn split_command_line(command: &str) -> Vec<String> {
@@ -766,7 +788,49 @@ mod tests {
         assert!(is_codex_executable(
             r#"C:\Users\Dev\AppData\Local\Programs\Codex\Codex.exe"#
         ));
+        assert!(is_codex_executable(
+            r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"#
+        ));
+        assert!(!is_codex_executable(
+            r#"C:\Users\Dev\AppData\Local\Programs\ChatGPT\ChatGPT.exe"#
+        ));
         assert!(!is_codex_executable("not-codex.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_root_detection_accepts_renamed_store_host_only() {
+        let renamed_codex = super::WindowsCodexProcess {
+            name: "ChatGPT.exe".to_string(),
+            process_id: 100,
+            parent_process_id: 1,
+            command_line: r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe""#.to_string(),
+            executable_path: r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"#.to_string(),
+            main_window_title: "Codex".to_string(),
+        };
+        let standalone_chatgpt = super::WindowsCodexProcess {
+            executable_path: r#"C:\Users\Dev\AppData\Local\Programs\ChatGPT\ChatGPT.exe"#
+                .to_string(),
+            ..renamed_codex.clone()
+        };
+
+        assert!(super::is_windows_codex_root_process(&renamed_codex));
+        assert!(!super::is_windows_codex_root_process(&standalone_chatgpt));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_spec_accepts_renamed_store_host() {
+        let path = r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"#;
+        let spec = build_launch_spec(ActiveCodexProcess {
+            pid: 42,
+            command_line: format!(r#""{path}""#),
+            executable_path: Some(path.to_string()),
+        })
+        .expect("renamed Codex desktop host should be restartable");
+
+        assert_eq!(spec.executable, path);
+        assert!(spec.args.is_empty());
     }
 
     #[test]

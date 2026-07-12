@@ -7,6 +7,7 @@ const {
   invokeBackendMock,
   exportFullBackupFileMock,
   importFullBackupFileMock,
+  isTauriRuntimeMock,
   getCurrentWindowMock,
   mockWindow,
 } = vi.hoisted(() => ({
@@ -14,13 +15,17 @@ const {
   invokeBackendMock: vi.fn(),
   exportFullBackupFileMock: vi.fn(),
   importFullBackupFileMock: vi.fn(),
+  isTauriRuntimeMock: vi.fn(),
   getCurrentWindowMock: vi.fn(),
   mockWindow: {
     startDragging: vi.fn(),
     toggleMaximize: vi.fn(),
     isMaximized: vi.fn().mockResolvedValue(false),
-    isFullscreen: vi.fn().mockResolvedValue(false),
-    setFullscreen: vi.fn().mockResolvedValue(undefined),
+    innerSize: vi.fn().mockResolvedValue({
+      toLogical: vi.fn().mockReturnValue({ width: 1290, height: 860 }),
+    }),
+    scaleFactor: vi.fn().mockResolvedValue(1.25),
+    setSize: vi.fn().mockResolvedValue(undefined),
     onResized: vi.fn().mockResolvedValue(() => {}),
     minimize: vi.fn(),
     close: vi.fn(),
@@ -29,6 +34,9 @@ const {
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: getCurrentWindowMock,
+  LogicalSize: class LogicalSize {
+    constructor(public width: number, public height: number) {}
+  },
 }));
 
 vi.mock("./hooks/useAccounts", () => ({
@@ -42,7 +50,7 @@ vi.mock("./lib/platform", async () => {
     invokeBackend: invokeBackendMock,
     exportFullBackupFile: exportFullBackupFileMock,
     importFullBackupFile: importFullBackupFileMock,
-    isTauriRuntime: () => false,
+    isTauriRuntime: isTauriRuntimeMock,
   };
 });
 
@@ -137,6 +145,15 @@ beforeEach(() => {
     pids: [],
   });
   getCurrentWindowMock.mockReturnValue(mockWindow);
+  isTauriRuntimeMock.mockReturnValue(false);
+  mockWindow.isMaximized.mockResolvedValue(false);
+  mockWindow.innerSize.mockResolvedValue({
+    toLogical: vi.fn().mockReturnValue({ width: 1290, height: 860 }),
+  });
+  mockWindow.scaleFactor.mockResolvedValue(1.25);
+  mockWindow.setSize.mockResolvedValue(undefined);
+  mockWindow.toggleMaximize.mockResolvedValue(undefined);
+  mockWindow.onResized.mockResolvedValue(() => {});
   exportFullBackupFileMock.mockResolvedValue(true);
   importFullBackupFileMock.mockResolvedValue(null);
   useAccountsMock.mockReturnValue(buildUseAccountsReturn());
@@ -152,6 +169,62 @@ describe("App", () => {
 
     expect(screen.getByText("Account cockpit")).toBeInTheDocument();
     expect(getCurrentWindowMock).not.toHaveBeenCalled();
+  });
+
+  it("uses native maximize and restore for the Windows caption button", async () => {
+    isTauriRuntimeMock.mockReturnValue(true);
+    mockWindow.isMaximized.mockResolvedValue(false);
+    await renderApp();
+    await flushAsyncWork();
+
+    mockWindow.isMaximized.mockResolvedValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "Maximize" }));
+    await flushAsyncWork();
+
+    expect(mockWindow.toggleMaximize).toHaveBeenCalledTimes(1);
+    expect(mockWindow.isMaximized).toHaveBeenCalled();
+    expect(await screen.findByRole("button", { name: "Restore" })).toBeInTheDocument();
+  });
+
+  it("clamps a restored window state to the configured minimum size", async () => {
+    isTauriRuntimeMock.mockReturnValue(true);
+    mockWindow.innerSize.mockResolvedValue({
+      toLogical: vi.fn().mockReturnValue({ width: 1278, height: 850 }),
+    });
+    await renderApp();
+    await flushAsyncWork();
+
+    expect(mockWindow.setSize).toHaveBeenCalledWith(
+      expect.objectContaining({ width: 1290, height: 860 })
+    );
+  });
+
+  it("starts native caption dragging even while the window is maximized", async () => {
+    isTauriRuntimeMock.mockReturnValue(true);
+    mockWindow.isMaximized.mockResolvedValue(true);
+    await renderApp();
+    await flushAsyncWork();
+
+    fireEvent.mouseDown(screen.getByTestId("window-drag-region"), {
+      button: 0,
+      detail: 1,
+    });
+
+    expect(mockWindow.startDragging).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses title-bar double-click for native maximize without starting a second drag", async () => {
+    isTauriRuntimeMock.mockReturnValue(true);
+    await renderApp();
+    await flushAsyncWork();
+
+    const dragRegion = screen.getByTestId("window-drag-region");
+    fireEvent.mouseDown(dragRegion, { button: 0, detail: 2 });
+    fireEvent.doubleClick(dragRegion);
+    await flushAsyncWork();
+
+    expect(mockWindow.startDragging).not.toHaveBeenCalled();
+    expect(mockWindow.toggleMaximize).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Home focused on refresh while the sidebar remains the single add-account entry point", async () => {

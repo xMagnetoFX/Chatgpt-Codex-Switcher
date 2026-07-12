@@ -23,7 +23,7 @@ export function TopBar({ title, heading, description, actions, compact = false }
               margin: 0,
               fontSize: compact ? 22 : 26,
               fontWeight: 600,
-              letterSpacing: "-0.035em",
+              letterSpacing: "-0.01em",
               color: "var(--text-strong)",
             }}
           >

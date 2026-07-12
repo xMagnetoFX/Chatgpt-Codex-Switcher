@@ -88,7 +88,7 @@ export function SectionHeading({
           margin: "4px 0 0",
           fontSize: 17,
           fontWeight: 600,
-          letterSpacing: "-0.025em",
+          letterSpacing: "-0.01em",
           color: "var(--text-strong)",
         }}
       >
@@ -189,9 +189,9 @@ export function StatePanel({
             width: 64,
             height: 64,
             borderRadius: 22,
-            border: `1px solid ${tone === "danger" ? "oklch(0.72 0.18 22 / 0.3)" : "var(--hairline)"}`,
-            background: tone === "danger" ? "oklch(0.72 0.18 22 / 0.1)" : "var(--glass-1)",
-            color: tone === "danger" ? "oklch(0.72 0.18 22)" : "var(--accent)",
+            border: `1px solid ${tone === "danger" ? "var(--danger-border)" : "var(--hairline)"}`,
+            background: tone === "danger" ? "var(--danger-soft)" : "var(--glass-1)",
+            color: tone === "danger" ? "var(--danger)" : "var(--accent)",
             display: "grid",
             placeItems: "center",
             margin: "0 auto",
@@ -211,7 +211,7 @@ export function StatePanel({
             margin: "6px 0 0",
             fontSize: 22,
             fontWeight: 600,
-            letterSpacing: "-0.035em",
+            letterSpacing: "-0.01em",
             color: "var(--text-strong)",
           }}
         >
