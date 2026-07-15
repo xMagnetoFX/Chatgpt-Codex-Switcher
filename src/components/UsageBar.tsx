@@ -34,10 +34,7 @@ function formatWindowDuration(minutes: number | null | undefined): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-function formatLimitLabel(
-  fallbackLabel: string,
-  windowMinutes: number | null | undefined
-): string {
+function formatLimitLabel(fallbackLabel: string, windowMinutes: number | null | undefined): string {
   if (!windowMinutes) return fallbackLabel;
   if (windowMinutes === 5 * 60) return "5h limit";
   if (windowMinutes === 7 * 24 * 60) return "Weekly limit";
@@ -57,9 +54,11 @@ function RateLimitBar({
 }) {
   const remainingPercent = Math.max(0, 100 - usedPercent);
   const fillClass =
-    remainingPercent <= 20 ? "usage-fill low" :
-    remainingPercent <= 40 ? "usage-fill mid" :
-    "usage-fill";
+    remainingPercent <= 20
+      ? "usage-fill low"
+      : remainingPercent <= 40
+        ? "usage-fill mid"
+        : "usage-fill";
 
   const windowLabel = formatWindowDuration(windowMinutes);
   const displayLabel = formatLimitLabel(label, windowMinutes);
@@ -70,7 +69,8 @@ function RateLimitBar({
     <div className="usage-row">
       <div className="usage-row-head">
         <span className="usage-label">
-          {displayLabel}{windowLabel ? ` (${windowLabel})` : ""}
+          {displayLabel}
+          {windowLabel ? ` (${windowLabel})` : ""}
         </span>
         <span className="usage-pct">
           {remainingPercent.toFixed(0)}%{" "}
@@ -79,14 +79,9 @@ function RateLimitBar({
         </span>
       </div>
       <div className="usage-track">
-        <div
-          className={fillClass}
-          style={{ width: `${Math.min(remainingPercent, 100)}%` }}
-        />
+        <div className={fillClass} style={{ width: `${Math.min(remainingPercent, 100)}%` }} />
       </div>
-      {exactResetLabel && (
-        <div className="usage-reset">{exactResetLabel}</div>
-      )}
+      {exactResetLabel && <div className="usage-reset">{exactResetLabel}</div>}
     </div>
   );
 }
@@ -139,8 +134,10 @@ export function UsageBar({ usage, loading }: UsageBarProps) {
     );
   }
 
-  const hasPrimary = usage.primary_used_percent !== null && usage.primary_used_percent !== undefined;
-  const hasSecondary = usage.secondary_used_percent !== null && usage.secondary_used_percent !== undefined;
+  const hasPrimary =
+    usage.primary_used_percent !== null && usage.primary_used_percent !== undefined;
+  const hasSecondary =
+    usage.secondary_used_percent !== null && usage.secondary_used_percent !== undefined;
 
   if (!hasPrimary && !hasSecondary) {
     return (
@@ -176,12 +173,23 @@ export function UsageBar({ usage, loading }: UsageBarProps) {
           resetsAt={usage.secondary_resets_at}
         />
       )}
-      {usage.credits_balance !== null && usage.credits_balance !== undefined && (
-        <div className="usage-reset">
-          Credits balance:{" "}
-          <span style={{ color: "var(--text-muted)" }}>{usage.credits_balance}</span>
+      {(usage.credits_balance !== null && usage.credits_balance !== undefined) ||
+      (usage.banked_resets !== null && usage.banked_resets !== undefined) ? (
+        <div className="usage-meta-row">
+          {usage.credits_balance !== null && usage.credits_balance !== undefined && (
+            <span className="usage-reset">
+              Credits balance:{" "}
+              <span style={{ color: "var(--text-muted)" }}>{usage.credits_balance}</span>
+            </span>
+          )}
+          {usage.banked_resets !== null && usage.banked_resets !== undefined && (
+            <span className="usage-reset">
+              Banked resets:{" "}
+              <span style={{ color: "var(--text-muted)" }}>{usage.banked_resets}</span>
+            </span>
+          )}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

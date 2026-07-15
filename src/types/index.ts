@@ -25,6 +25,7 @@ export interface UsageInfo {
   has_credits: boolean | null;
   unlimited_credits: boolean | null;
   credits_balance: string | null;
+  banked_resets: number | null;
   error: string | null;
 }
 

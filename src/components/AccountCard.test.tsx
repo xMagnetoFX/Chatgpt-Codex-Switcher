@@ -26,6 +26,7 @@ const baseAccount: AccountWithUsage = {
     has_credits: true,
     unlimited_credits: false,
     credits_balance: "0",
+    banked_resets: 0,
     error: null,
   },
 };

@@ -1294,6 +1294,13 @@ textarea {
   font-family: var(--font-mono);
 }
 
+.usage-meta-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+
 /* =========================================================
    SELECT
    ========================================================= */

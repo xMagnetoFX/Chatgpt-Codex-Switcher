@@ -25,6 +25,7 @@ function makeAccount(overrides: Partial<AccountWithUsage> = {}): AccountWithUsag
       has_credits: null,
       unlimited_credits: null,
       credits_balance: null,
+      banked_resets: null,
       error: null,
     },
     ...overrides,
@@ -62,6 +63,7 @@ describe("accountDisplay", () => {
             has_credits: null,
             unlimited_credits: null,
             credits_balance: null,
+            banked_resets: null,
             error: "network unavailable",
           },
         })

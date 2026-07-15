@@ -272,6 +272,8 @@ pub struct UsageInfo {
     pub unlimited_credits: Option<bool>,
     /// Credit balance string (e.g., "$10.50")
     pub credits_balance: Option<String>,
+    /// Number of banked rate-limit resets available to the account
+    pub banked_resets: Option<i64>,
     /// Error message if usage fetch failed
     pub error: Option<String>,
 }
@@ -290,6 +292,7 @@ impl UsageInfo {
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
+            banked_resets: None,
             error: Some(error),
         }
     }
@@ -338,6 +341,8 @@ pub struct RateLimitStatusPayload {
     pub rate_limit: Option<RateLimitDetails>,
     #[serde(default)]
     pub credits: Option<CreditStatusDetails>,
+    #[serde(default)]
+    pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -359,4 +364,10 @@ pub struct CreditStatusDetails {
     pub unlimited: bool,
     #[serde(default)]
     pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitResetCredits {
+    #[serde(default)]
+    pub available_count: Option<i64>,
 }

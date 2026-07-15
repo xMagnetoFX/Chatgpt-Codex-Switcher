@@ -16,6 +16,7 @@ function usage(overrides: Partial<UsageInfo>): UsageInfo {
     has_credits: null,
     unlimited_credits: null,
     credits_balance: null,
+    banked_resets: null,
     error: null,
     ...overrides,
   };
@@ -50,5 +51,20 @@ describe("UsageBar", () => {
 
     expect(screen.getByText("5h limit (5h)")).toBeInTheDocument();
     expect(screen.getByText("Weekly limit (7d)")).toBeInTheDocument();
+  });
+
+  it("shows the number of banked resets, including zero", () => {
+    render(
+      <UsageBar
+        usage={usage({
+          primary_used_percent: 20,
+          primary_window_minutes: 7 * 24 * 60,
+          banked_resets: 0,
+        })}
+      />
+    );
+
+    expect(screen.getByText("Banked resets:")).toBeInTheDocument();
+    expect(screen.getByText("0")).toBeInTheDocument();
   });
 });

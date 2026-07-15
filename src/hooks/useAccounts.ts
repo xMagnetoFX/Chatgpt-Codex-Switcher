@@ -38,6 +38,7 @@ export function useAccounts() {
       has_credits: null,
       unlimited_credits: null,
       credits_balance: null,
+      banked_resets: null,
       error: message,
     }),
     []

@@ -38,6 +38,7 @@ pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
                 has_credits: None,
                 unlimited_credits: None,
                 credits_balance: None,
+                banked_resets: None,
                 error: None,
             })
         }
@@ -365,6 +366,9 @@ fn collect_last_text(value: &Value, last: &mut Option<String>) {
 
 /// Convert API response to UsageInfo
 fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPayload) -> UsageInfo {
+    let banked_resets = payload
+        .rate_limit_reset_credits
+        .and_then(|credits| credits.available_count);
     let (primary, secondary) = extract_rate_limits(payload.rate_limit);
     let credits = extract_credits(payload.credits);
 
@@ -386,6 +390,7 @@ fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPaylo
         has_credits: credits.as_ref().map(|c| c.has_credits),
         unlimited_credits: credits.as_ref().map(|c| c.unlimited),
         credits_balance: credits.and_then(|c| c.balance),
+        banked_resets,
         error: None,
     }
 }
@@ -428,8 +433,22 @@ pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_account_usage;
-    use crate::types::StoredAccount;
+    use super::{convert_payload_to_usage_info, get_account_usage};
+    use crate::types::{RateLimitStatusPayload, StoredAccount};
+
+    #[test]
+    fn maps_banked_reset_count_from_usage_payload() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": null,
+            "credits": null,
+            "rate_limit_reset_credits": { "available_count": 3 }
+        }))
+        .expect("valid usage payload");
+
+        let usage = convert_payload_to_usage_info("account-1", payload);
+        assert_eq!(usage.banked_resets, Some(3));
+    }
 
     #[tokio::test]
     async fn api_key_usage_is_an_expected_no_data_state() {
@@ -442,6 +461,7 @@ mod tests {
         assert_eq!(usage.plan_type.as_deref(), Some("api_key"));
         assert!(usage.primary_used_percent.is_none());
         assert!(usage.secondary_used_percent.is_none());
+        assert!(usage.banked_resets.is_none());
         assert!(usage.error.is_none());
     }
 }

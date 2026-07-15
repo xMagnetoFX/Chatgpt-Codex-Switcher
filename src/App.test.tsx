@@ -35,7 +35,10 @@ const {
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: getCurrentWindowMock,
   LogicalSize: class LogicalSize {
-    constructor(public width: number, public height: number) {}
+    constructor(
+      public width: number,
+      public height: number
+    ) {}
   },
 }));
 
@@ -77,6 +80,7 @@ function makeAccount(id: string, name: string, email: string, isActive = false):
       has_credits: true,
       unlimited_credits: false,
       credits_balance: "0",
+      banked_resets: 0,
       error: null,
     },
   };
