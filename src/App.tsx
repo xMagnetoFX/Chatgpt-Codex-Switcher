@@ -176,6 +176,22 @@ function App() {
     }
   }, []);
 
+  // The window starts hidden (Windows config) so users never see an
+  // unpainted webview flash black; reveal it once React has produced its
+  // first frame. A Rust-side fallback shows it anyway after 5s if this
+  // never runs.
+  useEffect(() => {
+    const appWindow = getAppWindow();
+    if (!appWindow) return;
+    const frame = window.requestAnimationFrame(() => {
+      void appWindow
+        .show()
+        .then(() => appWindow.setFocus())
+        .catch((err) => console.error("Failed to show window:", err));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
   useEffect(() => {
     void checkProcesses();
     const interval = window.setInterval(() => {

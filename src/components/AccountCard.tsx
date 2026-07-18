@@ -85,6 +85,15 @@ export function AccountCard({
     if (account.usage && !account.usage.error) setLastRefresh(new Date());
   }, [account.usage]);
 
+  // Re-render periodically so the relative "last refresh" label stays honest
+  // between usage refreshes.
+  const [, setRefreshTick] = useState(0);
+  useEffect(() => {
+    if (!lastRefresh) return;
+    const interval = window.setInterval(() => setRefreshTick((tick) => tick + 1), 10000);
+    return () => window.clearInterval(interval);
+  }, [lastRefresh]);
+
   useEffect(() => {
     if (isEditing && inputRef.current) {
       inputRef.current.focus();

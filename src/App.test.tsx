@@ -27,6 +27,8 @@ const {
     scaleFactor: vi.fn().mockResolvedValue(1.25),
     setSize: vi.fn().mockResolvedValue(undefined),
     onResized: vi.fn().mockResolvedValue(() => {}),
+    show: vi.fn().mockResolvedValue(undefined),
+    setFocus: vi.fn().mockResolvedValue(undefined),
     minimize: vi.fn(),
     close: vi.fn(),
   },

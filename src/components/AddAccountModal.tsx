@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   describeFileSource,
   isTauriRuntime,
@@ -36,8 +36,12 @@ export function AddAccountModal({
   const [copied, setCopied] = useState<boolean>(false);
   const isPrimaryDisabled = loading || (activeTab === "oauth" && oauthPending);
   const tauriRuntime = isTauriRuntime();
+  // Bumped whenever a flow is superseded (close, cancel, retry) so an
+  // in-flight completeOAuth rejection can't write stale error state later.
+  const oauthAttemptRef = useRef(0);
 
   const resetForm = () => {
+    oauthAttemptRef.current += 1;
     setFileSource(null);
     setError(null);
     setLoading(false);
@@ -53,16 +57,20 @@ export function AddAccountModal({
   };
 
   const handleOAuthLogin = async () => {
+    const attempt = ++oauthAttemptRef.current;
     try {
       setLoading(true);
       setError(null);
       const info = await onStartOAuth();
+      if (attempt !== oauthAttemptRef.current) return;
       setAuthUrl(info.auth_url);
       setOauthPending(true);
       setLoading(false);
       await onCompleteOAuth();
+      if (attempt !== oauthAttemptRef.current) return;
       handleClose();
     } catch (err) {
+      if (attempt !== oauthAttemptRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
       setLoading(false);
       setOauthPending(false);
@@ -122,6 +130,7 @@ export function AddAccountModal({
               key={tab}
               onClick={() => {
                 if (tab === "import" && oauthPending) {
+                  oauthAttemptRef.current += 1;
                   void onCancelOAuth().catch((err) => console.error("Failed to cancel login:", err));
                   setOauthPending(false);
                   setLoading(false);
