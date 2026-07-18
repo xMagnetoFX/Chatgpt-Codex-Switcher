@@ -71,10 +71,22 @@ fn mutate_store<T, F>(sync_active_auth: bool, mutator: F) -> Result<T>
 where
     F: FnOnce(&mut AccountsStore) -> Result<T>,
 {
+    mutate_store_with_sync_decision(move |store| {
+        let output = mutator(store)?;
+        Ok((output, sync_active_auth))
+    })
+}
+
+/// Like `mutate_store`, but the mutator decides (based on the store contents)
+/// whether the active auth.json should be re-synced after the write.
+fn mutate_store_with_sync_decision<T, F>(mutator: F) -> Result<T>
+where
+    F: FnOnce(&mut AccountsStore) -> Result<(T, bool)>,
+{
     let _lock = acquire_store_lock()?;
     let path = get_accounts_file()?;
     let mut store = load_accounts_from_path(&path)?;
-    let output = mutator(&mut store)?;
+    let (output, sync_active_auth) = mutator(&mut store)?;
     write_accounts_store_atomic(&path, &store)?;
     if sync_active_auth {
         sync_active_auth_for_store(&store)?;
@@ -208,11 +220,18 @@ fn sync_active_auth_for_store(store: &AccountsStore) -> Result<()> {
 
 struct StoreLock {
     path: PathBuf,
+    token: String,
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Only remove the lock file if it is still ours. A contender that
+        // judged our lock stale may have replaced it with its own.
+        let still_ours = fs::read_to_string(&self.path)
+            .is_ok_and(|contents| contents.contains(&self.token));
+        if still_ours {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -227,17 +246,18 @@ fn acquire_store_lock() -> Result<StoreLock> {
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
+                let token = uuid::Uuid::new_v4().to_string();
                 let _ = writeln!(
                     file,
-                    "pid={} time={:?}",
+                    "pid={} token={token} time={:?}",
                     std::process::id(),
                     SystemTime::now()
                 );
-                return Ok(StoreLock { path });
+                let _ = file.flush();
+                return Ok(StoreLock { path, token });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if lock_is_stale(&path) {
-                    let _ = fs::remove_file(&path);
+                if lock_is_stale(&path) && steal_stale_lock(&path) {
                     continue;
                 }
 
@@ -255,6 +275,22 @@ fn acquire_store_lock() -> Result<StoreLock> {
                     .with_context(|| format!("Failed to acquire store lock: {}", path.display()));
             }
         }
+    }
+}
+
+/// Claim a stale lock by atomically renaming it aside. Rename fails for all
+/// but one contender, so two processes can never both "remove" the same stale
+/// lock and then race to create fresh ones.
+fn steal_stale_lock(path: &Path) -> bool {
+    let mut steal_name = path.as_os_str().to_owned();
+    steal_name.push(format!(".stale-{}", uuid::Uuid::new_v4()));
+    let steal_path = PathBuf::from(steal_name);
+
+    if fs::rename(path, &steal_path).is_ok() {
+        let _ = fs::remove_file(&steal_path);
+        true
+    } else {
+        false
     }
 }
 
@@ -377,6 +413,7 @@ fn merge_accounts_store(
 ) -> ImportAccountsSummary {
     let imported_version = imported.version;
     let imported_active_id = imported.active_account_id;
+    let imported_masked_ids = imported.masked_account_ids;
     let total_in_payload = imported.accounts.len();
     let mut imported_count = 0usize;
     let mut existing_ids = current
@@ -421,6 +458,17 @@ fn merge_accounts_store(
             }
         } else {
             current.active_account_id = current.accounts.first().map(|account| account.id.clone());
+        }
+    }
+
+    for masked_id in imported_masked_ids {
+        if current
+            .accounts
+            .iter()
+            .any(|account| account.id == masked_id)
+            && !current.masked_account_ids.contains(&masked_id)
+        {
+            current.masked_account_ids.push(masked_id);
         }
     }
 
@@ -516,7 +564,10 @@ pub fn update_account_chatgpt_tokens(
     email: Option<String>,
     plan_type: Option<String>,
 ) -> Result<StoredAccount> {
-    mutate_store(true, |store| {
+    // Only re-sync auth.json when the refreshed account is the active one.
+    // Rewriting it for background refreshes could clobber tokens a running
+    // Codex CLI just rotated on its own.
+    mutate_store_with_sync_decision(|store| {
         let is_active = store.active_account_id.as_deref() == Some(account_id);
         let account = store
             .accounts
@@ -551,11 +602,7 @@ pub fn update_account_chatgpt_tokens(
             account.plan_type = Some(new_plan_type);
         }
 
-        if is_active {
-            store.active_account_id = Some(account.id.clone());
-        }
-
-        Ok(account.clone())
+        Ok((account.clone(), is_active))
     })
 }
 
@@ -752,6 +799,52 @@ mod tests {
             Some(imported_second.id.as_str())
         );
         assert_eq!(auth.openai_api_key.as_deref(), Some("sk-import-2"));
+    }
+
+    #[test]
+    fn updating_background_chatgpt_tokens_does_not_rewrite_auth_json() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+
+        let _active = add_account(api_account("Active", "sk-active")).expect("add active");
+        let background = add_account(chatgpt_account("Background", "old")).expect("add bg");
+
+        let auth_path = crate::auth::switcher::get_codex_auth_file().expect("auth path");
+        std::fs::remove_file(&auth_path).expect("remove auth.json");
+
+        update_account_chatgpt_tokens(
+            &background.id,
+            "id-new".to_string(),
+            "access-new".to_string(),
+            "refresh-new".to_string(),
+            None,
+            None,
+            None,
+        )
+        .expect("update background tokens");
+
+        assert!(
+            !auth_path.exists(),
+            "background token refresh must not rewrite auth.json"
+        );
+    }
+
+    #[test]
+    fn full_import_preserves_masked_ids_for_present_accounts() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+
+        let imported = api_account("Masked", "sk-masked");
+        merge_imported_accounts(AccountsStore {
+            version: 1,
+            accounts: vec![imported.clone()],
+            active_account_id: None,
+            masked_account_ids: vec![imported.id.clone(), "missing-account".to_string()],
+        })
+        .expect("merge accounts");
+
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(store.masked_account_ids, vec![imported.id]);
     }
 
     #[test]

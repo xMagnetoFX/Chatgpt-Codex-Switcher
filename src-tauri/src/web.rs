@@ -147,14 +147,15 @@ fn handle_request(
 
     let method = request.method().clone();
     let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or("").to_string();
 
-    if method == Method::Get && url == "/api/health" {
+    if method == Method::Get && path == "/api/health" {
         respond_json(request, StatusCode(200), &json!({ "ok": true }))?;
         return Ok(());
     }
 
-    if method == Method::Post && url.starts_with("/api/invoke/") {
-        let command = url.trim_start_matches("/api/invoke/");
+    if method == Method::Post && path.starts_with("/api/invoke/") {
+        let command = path.trim_start_matches("/api/invoke/");
         let payload = parse_request_json(&mut request)?;
         let result = runtime.block_on(invoke_web_command(command, payload));
         match result {

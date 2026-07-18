@@ -183,7 +183,7 @@ export function useAccounts() {
       );
       throw err;
     }
-  }, []);
+  }, [buildUsageError]);
 
   const warmupAccount = useCallback(async (accountId: string) => {
     try {
@@ -366,7 +366,11 @@ export function useAccounts() {
   }, []);
 
   useEffect(() => {
-    loadAccounts().then((accountList) => refreshUsage(accountList));
+    loadAccounts()
+      .then((accountList) => refreshUsage(accountList))
+      .catch((err) => {
+        console.error("Failed to load initial usage:", err);
+      });
 
     // Auto-refresh usage every 60 seconds (same as official Codex CLI)
     const interval = setInterval(() => {

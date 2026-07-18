@@ -141,27 +141,34 @@ fn add_imported_account(account: StoredAccount) -> anyhow::Result<StoredAccount>
 /// Switch to a different account
 #[tauri::command]
 pub async fn switch_account(account_id: String) -> Result<(), String> {
-    ensure_switch_allowed().map_err(|e| e.to_string())?;
-    ensure_account_exists(&account_id)?;
-    activate_account_on_disk(&account_id)?;
-
-    Ok(())
+    // Process polling and store locking can block for seconds; keep that off
+    // the async worker threads.
+    tokio::task::spawn_blocking(move || {
+        ensure_switch_allowed().map_err(|e| e.to_string())?;
+        ensure_account_exists(&account_id)?;
+        activate_account_on_disk(&account_id)
+    })
+    .await
+    .map_err(|e| format!("Switch task failed: {e}"))?
 }
 
 /// Stop running Codex windows, switch accounts, and relaunch Codex.
 #[tauri::command]
 pub async fn restart_codex_and_switch_account(account_id: String) -> Result<(), String> {
-    ensure_account_exists(&account_id)?;
+    tokio::task::spawn_blocking(move || {
+        ensure_account_exists(&account_id)?;
 
-    let restart_plan = prepare_codex_restart_plan().map_err(|e| e.to_string())?;
-    stop_codex_for_restart(&restart_plan).map_err(|e| e.to_string())?;
-    let switch_result = activate_account_on_disk(&account_id);
-    let restart_result = start_codex_from_restart_plan(&restart_plan).map_err(|e| e.to_string());
+        let restart_plan = prepare_codex_restart_plan().map_err(|e| e.to_string())?;
+        stop_codex_for_restart(&restart_plan).map_err(|e| e.to_string())?;
+        let switch_result = activate_account_on_disk(&account_id);
+        let restart_result =
+            start_codex_from_restart_plan(&restart_plan).map_err(|e| e.to_string());
 
-    switch_result?;
-    restart_result?;
-
-    Ok(())
+        switch_result?;
+        restart_result
+    })
+    .await
+    .map_err(|e| format!("Restart task failed: {e}"))?
 }
 
 fn ensure_account_exists(account_id: &str) -> Result<(), String> {

@@ -124,7 +124,10 @@ function App() {
   const autoWarmupTriggeredRef = useRef(false);
 
   const activeAccount = accounts.find((account) => account.is_active);
-  const otherAccounts = accounts.filter((account) => !account.is_active);
+  const otherAccounts = useMemo(
+    () => accounts.filter((account) => !account.is_active),
+    [accounts]
+  );
   const activeAccountMasked = activeAccount ? maskedAccounts.has(activeAccount.id) : false;
   const hasRunningProcesses = processInfo ? processInfo.count > 0 : false;
   const attentionCount = accounts.filter(needsAttention).length;
@@ -279,9 +282,18 @@ function App() {
     });
   };
 
+  const showWarmupToast = useCallback((message: string, isError = false) => {
+    setWarmupToast({ message, isError });
+    window.setTimeout(() => setWarmupToast(null), 2500);
+  }, []);
+
   const handleSwitch = async (accountId: string) => {
     const latestProcessInfo = await checkProcesses();
     if (latestProcessInfo && !latestProcessInfo.can_switch && !restartSwitchEnabled) {
+      showWarmupToast(
+        "Codex is running. Close it first, or enable restart & switch in Settings.",
+        true
+      );
       return;
     }
 
@@ -299,6 +311,7 @@ function App() {
       void checkProcesses();
     } catch (err) {
       console.error("Failed to switch account:", err);
+      showWarmupToast(`Switch failed: ${formatWarmupError(err)}`, true);
     } finally {
       setSwitchingId(null);
     }
@@ -326,6 +339,9 @@ function App() {
       await refreshUsage();
       setRefreshSuccess(true);
       window.setTimeout(() => setRefreshSuccess(false), 2000);
+    } catch (err) {
+      console.error("Failed to refresh usage:", err);
+      showWarmupToast(`Usage refresh failed: ${formatWarmupError(err)}`, true);
     } finally {
       setIsRefreshing(false);
     }
@@ -339,15 +355,13 @@ function App() {
       await refreshUsage(accountList);
       setRefreshSuccess(true);
       window.setTimeout(() => setRefreshSuccess(false), 2000);
+    } catch (err) {
+      console.error("Failed to reload workspace:", err);
+      showWarmupToast(`Workspace reload failed: ${formatWarmupError(err)}`, true);
     } finally {
       setIsRefreshing(false);
     }
   };
-
-  const showWarmupToast = useCallback((message: string, isError = false) => {
-    setWarmupToast({ message, isError });
-    window.setTimeout(() => setWarmupToast(null), 2500);
-  }, []);
 
   const runWarmupAll = useCallback(
     async ({ automatic = false }: { automatic?: boolean } = {}) => {

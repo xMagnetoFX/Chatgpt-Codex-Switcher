@@ -320,7 +320,18 @@ async fn handle_oauth_request(
             params.keys().collect::<Vec<_>>()
         );
 
-        // Check for error response
+        // Verify state before anything else. A stray request (browser
+        // prefetch, another local process) must not abort the pending login,
+        // so mismatches are ignored rather than treated as fatal.
+        if params.get("state").map(String::as_str) != Some(expected_state) {
+            println!("[OAuth] Ignoring callback with missing or mismatched state");
+            let _ = request.respond(Response::from_string("State mismatch").with_status_code(400));
+            return HandleResult::Continue;
+        }
+
+        println!("[OAuth] State verified OK");
+
+        // Check for error response (state-verified, so it's really from our flow)
         if let Some(error) = params.get("error") {
             let error_desc = params
                 .get("error_description")
@@ -333,15 +344,6 @@ async fn handle_oauth_request(
             );
             return HandleResult::Error(anyhow::anyhow!("OAuth error: {error} - {error_desc}"));
         }
-
-        // Verify state
-        if params.get("state").map(String::as_str) != Some(expected_state) {
-            println!("[OAuth] State mismatch!");
-            let _ = request.respond(Response::from_string("State mismatch").with_status_code(400));
-            return HandleResult::Error(anyhow::anyhow!("OAuth state mismatch"));
-        }
-
-        println!("[OAuth] State verified OK");
 
         // Get the authorization code
         let code = match params.get("code") {

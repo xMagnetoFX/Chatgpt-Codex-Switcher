@@ -106,7 +106,7 @@ async fn parse_usage_response(
         .context("Failed to read response body")?;
     println!(
         "[Usage] Response body: {}",
-        &body_text[..body_text.len().min(200)]
+        truncate_to_char_boundary(&body_text, 200)
     );
 
     let payload: RateLimitStatusPayload =
@@ -305,9 +305,21 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
-    let mut out = text[..max_len].to_string();
+    let mut out = truncate_to_char_boundary(text, max_len).to_string();
     out.push_str("...");
     out
+}
+
+/// Truncate to at most `max_len` bytes without splitting a UTF-8 character.
+fn truncate_to_char_boundary(text: &str, max_len: usize) -> &str {
+    if text.len() <= max_len {
+        return text;
+    }
+    let mut end = max_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn extract_text_from_sse(body: &str) -> Option<String> {
@@ -435,6 +447,14 @@ pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
 mod tests {
     use super::{convert_payload_to_usage_info, get_account_usage};
     use crate::types::{RateLimitStatusPayload, StoredAccount};
+
+    #[test]
+    fn truncates_multibyte_text_without_panicking() {
+        // "é" is 2 bytes in UTF-8; cutting at byte 3 would split the second char.
+        assert_eq!(super::truncate_text("ééééé", 3), "é...");
+        assert_eq!(super::truncate_to_char_boundary("ééééé", 3), "é");
+        assert_eq!(super::truncate_text("abc", 3), "abc");
+    }
 
     #[test]
     fn maps_banked_reset_count_from_usage_payload() {
