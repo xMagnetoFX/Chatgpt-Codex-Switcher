@@ -176,6 +176,21 @@ jobs:
       - name: Test Rust serially
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets -- --test-threads=1
 
+      - name: Build universal macOS companion binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin codex-web --target aarch64-apple-darwin
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin codex-web --target x86_64-apple-darwin
+          mkdir -p "$CARGO_TARGET_DIR/universal-apple-darwin/release"
+          lipo -create \
+            "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/codex-web" \
+            "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/codex-web" \
+            -output "$CARGO_TARGET_DIR/universal-apple-darwin/release/codex-web"
+          chmod +x "$CARGO_TARGET_DIR/universal-apple-darwin/release/codex-web"
+
       - name: Build Tauri packages
         run: corepack pnpm tauri build --ci --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
 
