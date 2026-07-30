@@ -1,16 +1,17 @@
 //! Account management Tauri commands
 
 use crate::auth::{
-    add_account, add_account_with_auto_name, create_chatgpt_account_from_refresh_token,
-    ensure_chatgpt_tokens_fresh_for_activation_with_client, get_account, get_active_account,
-    get_full_backup_key, get_or_create_full_backup_key, import_from_auth_json,
-    import_from_auth_json_contents, load_accounts, merge_imported_accounts, remove_account,
-    set_active_account, sync_active_account_from_current_auth, touch_account,
-    ChatGptTokenRefreshClient, HttpChatGptTokenRefreshClient,
+    create_chatgpt_account_from_refresh_token, get_full_backup_key, get_or_create_full_backup_key,
+    import_from_auth_json, import_from_auth_json_contents, load_accounts,
+    reconcile_current_auth_catalog, ChatGptTokenRefreshClient, HttpChatGptTokenRefreshClient,
+};
+use crate::commands::activation::{
+    activate_existing_account_with_client, add_imported_account_with_client,
+    delete_account_with_client, merge_imported_accounts_with_client,
+    persist_imported_account_catalog_only,
 };
 use crate::commands::process::{
-    ensure_switch_allowed, prepare_codex_restart_plan, restart_antigravity_background_processes,
-    start_codex_from_restart_plan, stop_codex_for_restart,
+    prepare_codex_restart_plan, start_codex_from_restart_plan, stop_codex_for_restart,
 };
 use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
 
@@ -46,7 +47,6 @@ const LEGACY_FULL_PRESET_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE
 const MAX_IMPORT_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const SLIM_IMPORT_CONCURRENCY: usize = 6;
-const AUTO_ACCOUNT_NAME_PREFIX: &str = "AC";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SlimPayload {
@@ -73,6 +73,7 @@ struct SlimAccountPayload {
 /// List all accounts with their info
 #[tauri::command]
 pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
+    reconcile_current_auth_catalog().map_err(|error| format!("{error:#}"))?;
     let store = load_accounts().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
@@ -88,14 +89,12 @@ pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
 /// Get the currently active account
 #[tauri::command]
 pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
+    reconcile_current_auth_catalog().map_err(|error| format!("{error:#}"))?;
     let store = load_accounts().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
-
-    if let Some(active) = get_active_account().map_err(|e| e.to_string())? {
-        Ok(Some(AccountInfo::from_stored(&active, active_id)))
-    } else {
-        Ok(None)
-    }
+    Ok(active_id
+        .and_then(|id| store.accounts.iter().find(|account| account.id == id))
+        .map(|active| AccountInfo::from_stored(active, active_id)))
 }
 
 /// Add an account from an auth.json file
@@ -108,7 +107,9 @@ pub async fn add_account_from_file(
     let account_name = name.unwrap_or_default();
     let account = import_from_auth_json(&path, account_name).map_err(|e| e.to_string())?;
 
-    let stored = add_imported_account(account).map_err(|e| e.to_string())?;
+    let stored = add_imported_account_with_client(account, &HttpChatGptTokenRefreshClient)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let store = load_accounts().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
@@ -124,20 +125,14 @@ pub async fn add_account_from_auth_json_text(
     let account_name = name.unwrap_or_default();
     let account =
         import_from_auth_json_contents(&contents, account_name).map_err(|e| e.to_string())?;
-    let stored = add_imported_account(account).map_err(|e| e.to_string())?;
+    let stored = add_imported_account_with_client(account, &HttpChatGptTokenRefreshClient)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let store = load_accounts().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
     Ok(AccountInfo::from_stored(&stored, active_id))
-}
-
-fn add_imported_account(account: StoredAccount) -> anyhow::Result<StoredAccount> {
-    if account.name.trim().is_empty() {
-        add_account_with_auto_name(account, AUTO_ACCOUNT_NAME_PREFIX)
-    } else {
-        add_account(account)
-    }
 }
 
 /// Switch to a different account
@@ -150,26 +145,9 @@ async fn switch_account_with_client<C>(account_id: String, client: &C) -> Result
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    let initial_account_id = account_id.clone();
-    tokio::task::spawn_blocking(move || {
-        ensure_switch_allowed().map_err(|e| e.to_string())?;
-        ensure_account_exists(&initial_account_id)?;
-        sync_active_account_from_current_auth().map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("Switch preparation task failed: {e}"))??;
-
-    prepare_account_for_activation_with_client(&account_id, client).await?;
-
-    tokio::task::spawn_blocking(move || {
-        // Refreshing can take long enough for Codex to start again, so check
-        // immediately before publishing the selected credentials.
-        ensure_switch_allowed().map_err(|e| e.to_string())?;
-        activate_account_on_disk(&account_id)
-    })
-    .await
-    .map_err(|e| format!("Switch task failed: {e}"))?
+    activate_existing_account_with_client(&account_id, client)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Stop running Codex windows, switch accounts, and relaunch Codex.
@@ -185,9 +163,7 @@ async fn restart_codex_and_switch_account_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    let plan_account_id = account_id.clone();
     let restart_plan = tokio::task::spawn_blocking(move || {
-        ensure_account_exists(&plan_account_id)?;
         let restart_plan = prepare_codex_restart_plan().map_err(|e| e.to_string())?;
         stop_codex_for_restart(&restart_plan).map_err(|e| e.to_string())?;
         Ok::<_, String>(restart_plan)
@@ -195,24 +171,9 @@ where
     .await
     .map_err(|e| format!("Restart preparation task failed: {e}"))??;
 
-    let switch_result = async {
-        tokio::task::spawn_blocking(|| {
-            sync_active_account_from_current_auth().map_err(|e| e.to_string())
-        })
+    let switch_result = activate_existing_account_with_client(&account_id, client)
         .await
-        .map_err(|e| format!("Token sync task failed: {e}"))??;
-
-        prepare_account_for_activation_with_client(&account_id, client).await?;
-
-        let activation_account_id = account_id.clone();
-        tokio::task::spawn_blocking(move || {
-            ensure_switch_allowed().map_err(|e| e.to_string())?;
-            activate_account_on_disk(&activation_account_id)
-        })
-        .await
-        .map_err(|e| format!("Switch task failed: {e}"))?
-    }
-    .await;
+        .map_err(|e| e.to_string());
 
     // Once the restart flow stops Codex, always attempt to relaunch it even if
     // credential synchronization or refresh fails.
@@ -226,50 +187,12 @@ where
     restart_result
 }
 
-async fn prepare_account_for_activation_with_client<C>(
-    account_id: &str,
-    client: &C,
-) -> Result<(), String>
-where
-    C: ChatGptTokenRefreshClient + ?Sized,
-{
-    let lookup_id = account_id.to_string();
-    let account = tokio::task::spawn_blocking(move || get_account(&lookup_id))
-        .await
-        .map_err(|e| format!("Account lookup task failed: {e}"))?
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
-
-    ensure_chatgpt_tokens_fresh_for_activation_with_client(&account, client)
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("Failed to refresh account '{}': {e}", account.name))
-}
-
-fn ensure_account_exists(account_id: &str) -> Result<(), String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
-    store
-        .accounts
-        .iter()
-        .any(|account| account.id == account_id)
-        .then_some(())
-        .ok_or_else(|| format!("Account not found: {account_id}"))
-}
-
-fn activate_account_on_disk(account_id: &str) -> Result<(), String> {
-    set_active_account(account_id).map_err(|e| e.to_string())?;
-    touch_account(account_id).map_err(|e| e.to_string())?;
-
-    restart_antigravity_background_processes();
-
-    Ok(())
-}
-
 /// Remove an account
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
-    remove_account(&account_id).map_err(|e| e.to_string())?;
-    Ok(())
+    delete_account_with_client(&account_id, &HttpChatGptTokenRefreshClient)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Rename an account
@@ -284,6 +207,7 @@ pub async fn rename_account(account_id: String, new_name: String) -> Result<(), 
 /// For ChatGPT accounts, only refresh token is exported.
 #[tauri::command]
 pub async fn export_accounts_slim_text() -> Result<String, String> {
+    reconcile_current_auth_catalog().map_err(|error| format!("{error:#}"))?;
     let store = load_accounts().map_err(|e| e.to_string())?;
     encode_slim_payload_from_store(&store).map_err(|e| e.to_string())
 }
@@ -301,22 +225,46 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         .await
         .map_err(|e| {
             format!(
-                "{e:#}\nHint: Slim import needs network access to refresh ChatGPT tokens. You can use Full encrypted file import when offline."
+                "{e:#}\nHint: Slim import needs network access to refresh ChatGPT tokens. Successfully restored accounts are saved immediately so rotated credentials are not lost."
             )
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let summary = merge_imported_accounts(imported).map_err(|e| e.to_string())?;
+    let imported_count = imported.accounts.len();
+    reconcile_current_auth_catalog().map_err(|error| {
+        format!(
+            "Imported accounts were saved, but live credentials could not be reconciled: {error:#}"
+        )
+    })?;
+    let latest = load_accounts().map_err(|e| e.to_string())?;
+    if latest.active_account_id.is_none() {
+        if let Some(target_id) = imported.active_account_id.as_deref().filter(|target_id| {
+            latest
+                .accounts
+                .iter()
+                .any(|account| account.id.as_str() == *target_id)
+        }) {
+            activate_existing_account_with_client(target_id, &HttpChatGptTokenRefreshClient)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Imported accounts were saved, but the selected account could not be activated: {e:#}"
+                    )
+                })?;
+        }
+    }
+
     Ok(ImportAccountsSummary {
         total_in_payload,
-        imported_count: summary.imported_count,
-        skipped_count: total_in_payload.saturating_sub(summary.imported_count),
+        imported_count,
+        skipped_count: total_in_payload.saturating_sub(imported_count),
     })
 }
 
 /// Export full account config as an encrypted file.
 #[tauri::command]
 pub async fn export_accounts_full_encrypted_file(path: String) -> Result<(), String> {
+    reconcile_current_auth_catalog().map_err(|error| format!("{error:#}"))?;
     let store = load_accounts().map_err(|e| e.to_string())?;
     let encrypted = encode_full_encrypted_store(&store).map_err(|e| e.to_string())?;
     write_encrypted_file(&path, &encrypted).map_err(|e| e.to_string())?;
@@ -325,6 +273,7 @@ pub async fn export_accounts_full_encrypted_file(path: String) -> Result<(), Str
 
 /// Export full account config as encrypted bytes for browser clients.
 pub async fn export_accounts_full_encrypted_bytes() -> Result<Vec<u8>, String> {
+    reconcile_current_auth_catalog().map_err(|error| format!("{error:#}"))?;
     let store = load_accounts().map_err(|e| e.to_string())?;
     encode_full_encrypted_store(&store).map_err(|e| e.to_string())
 }
@@ -338,7 +287,9 @@ pub async fn import_accounts_full_encrypted_file(
     let imported = decode_full_encrypted_store(&encrypted).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let summary = merge_imported_accounts(imported).map_err(|e| e.to_string())?;
+    let summary = merge_imported_accounts_with_client(imported, &HttpChatGptTokenRefreshClient)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(summary)
 }
 
@@ -349,7 +300,9 @@ pub async fn import_accounts_full_encrypted_bytes(
     let imported = decode_full_encrypted_store(&bytes).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let summary = merge_imported_accounts(imported).map_err(|e| e.to_string())?;
+    let summary = merge_imported_accounts_with_client(imported, &HttpChatGptTokenRefreshClient)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(summary)
 }
 
@@ -539,7 +492,8 @@ async fn restore_slim_accounts(
             }
             _ => anyhow::bail!("Unsupported auth type in slim payload"),
         };
-        Ok::<StoredAccount, anyhow::Error>(account)
+        persist_imported_account_catalog_only(account)
+            .with_context(|| format!("Failed to save restored account `{account_name}`"))
     }))
     .buffered(SLIM_IMPORT_CONCURRENCY);
 
@@ -746,6 +700,8 @@ fn validate_imported_store(store: &AccountsStore) -> anyhow::Result<()> {
         if !names.insert(account.name.clone()) {
             anyhow::bail!("Import contains duplicate account name: {}", account.name);
         }
+        crate::auth::validate_stored_account_credentials(account)
+            .with_context(|| format!("Import contains invalid credentials for {}", account.name))?;
     }
 
     if let Some(active_id) = &store.active_account_id {
@@ -776,6 +732,7 @@ mod tests {
 
     use futures::future::BoxFuture;
 
+    use crate::auth::switcher::{get_codex_auth_file, write_auth_for_test};
     use crate::auth::{add_account, get_account, read_current_auth, RefreshTokenResponse};
 
     struct TestEnv {
@@ -999,6 +956,103 @@ mod tests {
         assert_eq!(restored.accounts[0].name, "Backup");
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn account_reads_refuse_unknown_live_credentials() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        add_account(StoredAccount::new_api_key(
+            "Primary".to_string(),
+            "sk-primary".to_string(),
+        ))
+        .expect("add account");
+        let unknown = serde_json::json!({ "OPENAI_API_KEY": "sk-unknown" });
+        std::fs::write(
+            get_codex_auth_file().expect("auth path"),
+            serde_json::to_vec(&unknown).expect("serialize unknown auth"),
+        )
+        .expect("write unknown auth");
+
+        assert!(list_accounts().await.is_err());
+        assert!(get_active_account_info().await.is_err());
+        assert!(export_accounts_slim_text().await.is_err());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn slim_export_imports_newer_live_refresh_token_first() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let stored = add_account(chatgpt_account(jwt_with_expiry(
+            chrono::Utc::now().timestamp() + 1800,
+        )))
+        .expect("add account");
+        let mut external = stored.clone();
+        external.auth_data = AuthData::ChatGPT {
+            id_token: id_token("user@example.com", "acct-one"),
+            access_token: jwt_with_expiry(chrono::Utc::now().timestamp() + 3600),
+            refresh_token: "refresh-new".to_string(),
+            account_id: Some("acct-one".to_string()),
+            last_refresh: Some(chrono::Utc::now()),
+        };
+        write_auth_for_test(&external).expect("write newer live auth");
+
+        let encoded = export_accounts_slim_text()
+            .await
+            .expect("export reconciled catalog");
+        let decoded = decode_slim_payload(&encoded).expect("decode slim export");
+
+        assert!(matches!(
+            decoded.accounts[0].refresh_token,
+            Some(ref refresh_token) if refresh_token == "refresh-new"
+        ));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn slim_import_activates_from_latest_catalog_state() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let existing =
+            StoredAccount::new_api_key("Existing".to_string(), "sk-existing".to_string());
+        crate::auth::save_accounts(&AccountsStore {
+            version: 1,
+            accounts: vec![existing],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        })
+        .expect("save inactive catalog");
+        let imported =
+            StoredAccount::new_api_key("Imported".to_string(), "sk-imported".to_string());
+        let payload = encode_slim_payload_from_store(&AccountsStore {
+            version: 1,
+            accounts: vec![imported.clone()],
+            active_account_id: Some(imported.id.clone()),
+            masked_account_ids: Vec::new(),
+        })
+        .expect("encode slim payload");
+        std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "0");
+
+        import_accounts_slim_text(payload)
+            .await
+            .expect("import and activate from latest state");
+
+        let store = load_accounts().expect("load store");
+        let stored_imported = store
+            .accounts
+            .iter()
+            .find(|account| account.name == "Imported")
+            .expect("find imported account");
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some(stored_imported.id.as_str())
+        );
+        let live = read_current_auth()
+            .expect("read live auth")
+            .expect("live auth exists");
+        assert!(matches!(live.openai_api_key, Some(ref key) if key == "sk-imported"));
+    }
+
     // These tests intentionally hold the env lock across await to serialize
     // process-wide environment mutation while the async command reads it.
     #[allow(clippy::await_holding_lock)]
@@ -1083,6 +1137,7 @@ mod tests {
             "sk-primary".to_string(),
         ))
         .expect("add primary account");
+        write_auth_for_test(&primary).expect("write primary auth");
         let target = add_account(chatgpt_account(jwt_with_expiry(
             chrono::Utc::now().timestamp() - 60,
         )))
@@ -1112,6 +1167,11 @@ mod tests {
         )
         .expect("serialize auth");
         assert_eq!(auth_after, auth_before);
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some(primary.id.as_str())
+        );
         let stored_target = get_account(&target.id)
             .expect("load target")
             .expect("target should exist");
@@ -1128,6 +1188,12 @@ mod tests {
     async fn refresh_does_not_publish_auth_before_final_process_check() {
         let _guard = crate::test_support::env_lock();
         let _env = TestEnv::new();
+        let primary = add_account(StoredAccount::new_api_key(
+            "Primary".to_string(),
+            "sk-primary".to_string(),
+        ))
+        .expect("add primary account");
+        write_auth_for_test(&primary).expect("write primary auth");
         let target = add_account(chatgpt_account(jwt_with_expiry(
             chrono::Utc::now().timestamp() - 60,
         )))
@@ -1160,6 +1226,11 @@ mod tests {
         )
         .expect("serialize auth");
         assert_eq!(auth_after, auth_before);
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some(primary.id.as_str())
+        );
         let stored_target = get_account(&target.id)
             .expect("load target")
             .expect("target should exist");

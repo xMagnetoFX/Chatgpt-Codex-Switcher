@@ -1,17 +1,38 @@
-//! Account switching logic - writes credentials to ~/.codex/auth.json
+//! Codex auth.json parsing, identity resolution, and guarded publication support.
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use tempfile::NamedTempFile;
 
-use crate::types::{AuthData, AuthDotJson, StoredAccount, TokenData};
+use super::atomic_file::{
+    read_snapshot, recover_externally_mutable_file, restore_if_matches, stage_file_change,
+    FileSnapshot, StagedFileChange,
+};
+use crate::types::{AccountsStore, AuthData, AuthDotJson, AuthMode, StoredAccount, TokenData};
 
-/// Get the official Codex home directory
+/// Exact raw state of Codex's externally mutable auth.json file.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AuthSnapshot {
+    file: FileSnapshot,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveAuthState {
+    Missing,
+    Exact,
+    Newer,
+    Stale,
+}
+
+pub(crate) struct ReconcileOutcome {
+    pub(crate) state: LiveAuthState,
+    pub(crate) matched_account_id: Option<String>,
+    pub(crate) catalog_changed: bool,
+}
+
+/// Get the official Codex home directory.
 pub fn get_codex_home() -> Result<PathBuf> {
-    // Check for CODEX_HOME environment variable first
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home));
     }
@@ -20,90 +41,415 @@ pub fn get_codex_home() -> Result<PathBuf> {
     Ok(home.join(".codex"))
 }
 
-/// Get the path to the official auth.json file
+/// Get the path to the official auth.json file.
 pub fn get_codex_auth_file() -> Result<PathBuf> {
     Ok(get_codex_home()?.join("auth.json"))
 }
 
-/// Remove the official auth.json file if it exists.
-pub fn clear_current_auth() -> Result<()> {
+pub(crate) fn capture_auth_snapshot() -> Result<AuthSnapshot> {
     let path = get_codex_auth_file()?;
-    if !path.exists() {
-        return Ok(());
+    recover_externally_mutable_file(&path)?;
+    Ok(AuthSnapshot {
+        file: read_snapshot(&path)?,
+    })
+}
+
+pub(crate) fn missing_auth_snapshot() -> AuthSnapshot {
+    AuthSnapshot {
+        file: FileSnapshot::Missing,
+    }
+}
+
+pub(crate) fn auth_snapshot_for_account(account: &StoredAccount) -> Result<AuthSnapshot> {
+    validate_stored_account_credentials(account)?;
+    let auth = create_auth_json(account)?;
+    let bytes = serde_json::to_vec_pretty(&auth).context("Failed to serialize auth.json")?;
+    Ok(AuthSnapshot {
+        file: FileSnapshot::present(bytes),
+    })
+}
+
+pub(crate) fn stage_auth_publication(
+    expected: &AuthSnapshot,
+    desired: &AuthSnapshot,
+) -> Result<StagedFileChange> {
+    stage_file_change(
+        &get_codex_auth_file()?,
+        expected.file.clone(),
+        desired.file.clone(),
+        "auth",
+    )
+}
+
+pub(crate) fn rollback_auth_publication(
+    expected_published: &AuthSnapshot,
+    previous: &AuthSnapshot,
+) -> Result<()> {
+    restore_if_matches(
+        &get_codex_auth_file()?,
+        expected_published.file.clone(),
+        previous.file.clone(),
+    )
+}
+
+pub(crate) fn auth_snapshot_matches_current(snapshot: &AuthSnapshot) -> Result<bool> {
+    let path = get_codex_auth_file()?;
+    recover_externally_mutable_file(&path)?;
+    Ok(read_snapshot(&path)? == snapshot.file)
+}
+
+pub(crate) fn reconcile_live_auth(
+    store: &mut AccountsStore,
+    snapshot: &AuthSnapshot,
+) -> Result<ReconcileOutcome> {
+    let resolution = resolve_live_auth(store, snapshot)?;
+    let (state, matched_account_id, updated_account) = match resolution {
+        LiveAuthResolution::Missing => (LiveAuthState::Missing, None, None),
+        LiveAuthResolution::Exact { account_id } => (LiveAuthState::Exact, Some(account_id), None),
+        LiveAuthResolution::Newer {
+            account_id,
+            updated_account,
+        } => (
+            LiveAuthState::Newer,
+            Some(account_id),
+            Some(updated_account),
+        ),
+        LiveAuthResolution::Stale { account_id } => (LiveAuthState::Stale, Some(account_id), None),
+    };
+
+    let mut catalog_changed = false;
+    if let Some(updated_account) = updated_account {
+        let existing = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == updated_account.id)
+            .context("Matched live account disappeared from the catalog")?;
+        *existing = *updated_account;
+        catalog_changed = true;
     }
 
-    fs::remove_file(&path)
-        .with_context(|| format!("Failed to remove auth.json: {}", path.display()))?;
+    if let Some(account_id) = matched_account_id.as_deref() {
+        if store.active_account_id.as_deref() != Some(account_id) {
+            store.active_account_id = Some(account_id.to_string());
+            catalog_changed = true;
+        }
+    } else if state == LiveAuthState::Missing && store.active_account_id.is_some() {
+        store.active_account_id = None;
+        catalog_changed = true;
+    }
+
+    let outcome = ReconcileOutcome {
+        state,
+        matched_account_id,
+        catalog_changed,
+    };
+    debug_assert!(
+        (outcome.state == LiveAuthState::Missing) == outcome.matched_account_id.is_none()
+    );
+    Ok(outcome)
+}
+
+pub(crate) fn validate_catalog_credential_uniqueness(store: &AccountsStore) -> Result<()> {
+    for account in &store.accounts {
+        validate_stored_account_credentials(account)?;
+    }
+
+    for (index, account) in store.accounts.iter().enumerate() {
+        for other in &store.accounts[index + 1..] {
+            if stored_accounts_share_credentials(account, other)? {
+                anyhow::bail!(
+                    "Accounts '{}' and '{}' contain credentials for the same login",
+                    account.name,
+                    other.name
+                );
+            }
+        }
+    }
     Ok(())
 }
 
-/// Switch to a specific account by writing its credentials to ~/.codex/auth.json
-pub fn switch_to_account(account: &StoredAccount) -> Result<()> {
-    let codex_home = get_codex_home()?;
+fn stored_accounts_share_credentials(
+    first: &StoredAccount,
+    second: &StoredAccount,
+) -> Result<bool> {
+    match (&first.auth_data, &second.auth_data) {
+        (AuthData::ApiKey { key: first }, AuthData::ApiKey { key: second }) => Ok(first == second),
+        (
+            AuthData::ChatGPT {
+                id_token: first_id,
+                access_token: first_access,
+                refresh_token: first_refresh,
+                account_id: first_account_id,
+                ..
+            },
+            AuthData::ChatGPT {
+                id_token: second_id,
+                access_token: second_access,
+                refresh_token: second_refresh,
+                account_id: second_account_id,
+                ..
+            },
+        ) => {
+            let exact_bundle = first_id == second_id
+                && first_access == second_access
+                && first_refresh == second_refresh;
+            let first_identity =
+                resolved_chatgpt_account_id(first_account_id.as_deref(), first_id)?;
+            let second_identity =
+                resolved_chatgpt_account_id(second_account_id.as_deref(), second_id)?;
+            Ok(exact_bundle || first_identity.is_some() && first_identity == second_identity)
+        }
+        _ => Ok(false),
+    }
+}
 
-    // Ensure the codex home directory exists
-    fs::create_dir_all(&codex_home)
-        .with_context(|| format!("Failed to create codex home: {}", codex_home.display()))?;
+fn resolve_live_auth(store: &AccountsStore, snapshot: &AuthSnapshot) -> Result<LiveAuthResolution> {
+    validate_catalog_credential_uniqueness(store)?;
+    let Some(live_auth) = parse_auth_snapshot(snapshot)? else {
+        return Ok(LiveAuthResolution::Missing);
+    };
 
-    let auth_json = create_auth_json(account)?;
+    let exact_matches = store
+        .accounts
+        .iter()
+        .filter(|account| stored_auth_matches_exact(account, &live_auth))
+        .collect::<Vec<_>>();
 
-    let auth_path = codex_home.join("auth.json");
-    let content =
-        serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
+    if exact_matches.len() > 1 {
+        anyhow::bail!(
+            "Codex auth.json matches more than one stored account. Remove the duplicate account before switching."
+        );
+    }
+    if let Some(account) = exact_matches.first() {
+        return Ok(LiveAuthResolution::Exact {
+            account_id: account.id.clone(),
+        });
+    }
 
-    write_auth_file_atomic(&auth_path, &content)?;
+    if live_auth.openai_api_key.is_some() {
+        anyhow::bail!(
+            "Codex auth.json contains an API key that is not in the account catalog. Import it or sign out of Codex before switching."
+        );
+    }
+
+    let live_tokens = live_auth
+        .tokens
+        .as_ref()
+        .context("Validated ChatGPT auth was missing tokens")?;
+    let live_account_id = resolved_chatgpt_account_id(
+        live_tokens.account_id.as_deref(),
+        &live_tokens.id_token,
+    )?
+    .context(
+        "Codex auth.json changed but has no stable ChatGPT account ID. Sign in again before switching accounts.",
+    )?;
+
+    let mut identity_matches = Vec::new();
+    for account in &store.accounts {
+        let AuthData::ChatGPT {
+            id_token,
+            account_id,
+            ..
+        } = &account.auth_data
+        else {
+            continue;
+        };
+        if account.auth_mode != AuthMode::ChatGPT {
+            continue;
+        }
+
+        let stored_account_id = resolved_chatgpt_account_id(account_id.as_deref(), id_token)
+            .with_context(|| {
+                format!(
+                    "Stored account '{}' has conflicting ChatGPT account IDs",
+                    account.name
+                )
+            })?;
+        if stored_account_id.as_deref() == Some(live_account_id.as_str()) {
+            identity_matches.push(account);
+        }
+    }
+
+    if identity_matches.is_empty() {
+        anyhow::bail!(
+            "Codex auth.json belongs to an account that is not in the catalog. Import it or sign out of Codex before switching."
+        );
+    }
+    if identity_matches.len() > 1 {
+        anyhow::bail!(
+            "More than one stored account has the ChatGPT identity used by Codex. Remove the duplicate account before switching."
+        );
+    }
+
+    let stored_account = identity_matches[0];
+    let stored_last_refresh = match &stored_account.auth_data {
+        AuthData::ChatGPT { last_refresh, .. } => *last_refresh,
+        AuthData::ApiKey { .. } => None,
+    };
+    let (Some(live_refresh), Some(stored_refresh)) = (live_auth.last_refresh, stored_last_refresh)
+    else {
+        anyhow::bail!(
+            "Codex auth.json credentials changed without complete refresh timestamps. Sign in again before switching accounts."
+        );
+    };
+
+    if live_refresh == stored_refresh {
+        anyhow::bail!(
+            "Codex auth.json credentials changed with an unchanged refresh timestamp. Sign in again before switching accounts."
+        );
+    }
+
+    if live_refresh < stored_refresh {
+        return Ok(LiveAuthResolution::Stale {
+            account_id: stored_account.id.clone(),
+        });
+    }
+
+    let mut updated_account = stored_account.clone();
+    let (email, plan_type) = parse_id_token_claims(&live_tokens.id_token);
+    updated_account.auth_data = AuthData::ChatGPT {
+        id_token: live_tokens.id_token.clone(),
+        access_token: live_tokens.access_token.clone(),
+        refresh_token: live_tokens.refresh_token.clone(),
+        account_id: Some(live_account_id),
+        last_refresh: Some(live_refresh),
+    };
+    if let Some(email) = email {
+        updated_account.email = Some(email);
+    }
+    if let Some(plan_type) = plan_type {
+        updated_account.plan_type = Some(plan_type);
+    }
+
+    Ok(LiveAuthResolution::Newer {
+        account_id: stored_account.id.clone(),
+        updated_account: Box::new(updated_account),
+    })
+}
+
+enum LiveAuthResolution {
+    Missing,
+    Exact {
+        account_id: String,
+    },
+    Newer {
+        account_id: String,
+        updated_account: Box<StoredAccount>,
+    },
+    Stale {
+        account_id: String,
+    },
+}
+
+fn stored_auth_matches_exact(account: &StoredAccount, live_auth: &AuthDotJson) -> bool {
+    match (&account.auth_data, &account.auth_mode) {
+        (AuthData::ApiKey { key }, AuthMode::ApiKey) => {
+            live_auth.tokens.is_none() && live_auth.openai_api_key.as_deref() == Some(key.as_str())
+        }
+        (
+            AuthData::ChatGPT {
+                id_token,
+                access_token,
+                refresh_token,
+                account_id,
+                ..
+            },
+            AuthMode::ChatGPT,
+        ) => {
+            live_auth.openai_api_key.is_none()
+                && live_auth.tokens.as_ref().is_some_and(|tokens| {
+                    let stored_identity =
+                        resolved_chatgpt_account_id(account_id.as_deref(), id_token).ok();
+                    let live_identity =
+                        resolved_chatgpt_account_id(tokens.account_id.as_deref(), &tokens.id_token)
+                            .ok();
+                    tokens.id_token == *id_token
+                        && tokens.access_token == *access_token
+                        && tokens.refresh_token == *refresh_token
+                        && stored_identity == live_identity
+                })
+        }
+        _ => false,
+    }
+}
+
+fn parse_auth_snapshot(snapshot: &AuthSnapshot) -> Result<Option<AuthDotJson>> {
+    let Some(bytes) = snapshot.file.bytes() else {
+        return Ok(None);
+    };
+    parse_auth_bytes(bytes).map(Some)
+}
+
+fn parse_auth_bytes(bytes: &[u8]) -> Result<AuthDotJson> {
+    let auth: AuthDotJson =
+        serde_json::from_slice(bytes).context("Failed to parse Codex auth.json")?;
+    validate_auth_dot_json(&auth)?;
+    Ok(auth)
+}
+
+fn validate_auth_dot_json(auth: &AuthDotJson) -> Result<()> {
+    match (auth.openai_api_key.as_deref(), auth.tokens.as_ref()) {
+        (Some(key), None) if !key.trim().is_empty() => Ok(()),
+        (Some(_), None) => anyhow::bail!("Codex auth.json contains an empty API key"),
+        (None, Some(tokens)) => {
+            if tokens.id_token.trim().is_empty()
+                || tokens.access_token.trim().is_empty()
+                || tokens.refresh_token.trim().is_empty()
+            {
+                anyhow::bail!("Codex auth.json contains incomplete ChatGPT credentials");
+            }
+            resolved_chatgpt_account_id(tokens.account_id.as_deref(), &tokens.id_token)?;
+            Ok(())
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Codex auth.json contains both API-key and ChatGPT credentials. Sign out before switching accounts."
+        ),
+        (None, None) => anyhow::bail!("Codex auth.json contains no usable credentials"),
+    }
+}
+
+pub(crate) fn validate_stored_account_credentials(account: &StoredAccount) -> Result<()> {
+    match (&account.auth_mode, &account.auth_data) {
+        (AuthMode::ApiKey, AuthData::ApiKey { key }) => {
+            if key.trim().is_empty() {
+                anyhow::bail!("API key is missing for account {}", account.name);
+            }
+        }
+        (
+            AuthMode::ChatGPT,
+            AuthData::ChatGPT {
+                id_token,
+                access_token,
+                refresh_token,
+                account_id,
+                ..
+            },
+        ) => {
+            if id_token.trim().is_empty() {
+                anyhow::bail!("ID token is missing for account {}", account.name);
+            }
+            if access_token.trim().is_empty() {
+                anyhow::bail!("Access token is missing for account {}", account.name);
+            }
+            if refresh_token.trim().is_empty() {
+                anyhow::bail!("Refresh token is missing for account {}", account.name);
+            }
+            resolved_chatgpt_account_id(account_id.as_deref(), id_token).with_context(|| {
+                format!(
+                    "Account '{}' has conflicting ChatGPT account IDs",
+                    account.name
+                )
+            })?;
+        }
+        _ => anyhow::bail!(
+            "Authentication mode does not match credentials for account {}",
+            account.name
+        ),
+    }
 
     Ok(())
 }
 
-fn write_auth_file_atomic(path: &Path, content: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("auth.json path did not have a parent directory")?;
-
-    let mut temp_file = NamedTempFile::new_in(parent)
-        .with_context(|| format!("Failed to create temp auth file in {}", parent.display()))?;
-    temp_file
-        .write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write temp auth file for {}", path.display()))?;
-    temp_file
-        .flush()
-        .with_context(|| format!("Failed to flush temp auth file for {}", path.display()))?;
-    temp_file
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("Failed to sync temp auth file for {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(temp_file.path(), fs::Permissions::from_mode(0o600)).with_context(
-            || format!("Failed to set temp auth permissions for {}", path.display()),
-        )?;
-    }
-
-    temp_file
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| {
-            format!(
-                "Failed to atomically replace auth file at {}",
-                path.display()
-            )
-        })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!("Failed to set auth file permissions for {}", path.display())
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Create an AuthDotJson structure from a StoredAccount
 fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
     match &account.auth_data {
         AuthData::ApiKey { key } => Ok(AuthDotJson {
@@ -130,12 +476,10 @@ fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
     }
 }
 
-/// Import an account from an existing auth.json file
+/// Import an account from an existing auth.json file.
 pub fn import_from_auth_json(path: &str, account_name: String) -> Result<StoredAccount> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read auth.json: {path}"))?;
-
-    import_from_auth_json_contents(&content, account_name)
+    let content = fs::read(path).with_context(|| format!("Failed to read auth.json: {path}"))?;
+    import_from_auth_json_bytes(&content, account_name)
         .with_context(|| format!("Failed to parse auth.json: {path}"))
 }
 
@@ -144,37 +488,37 @@ pub fn import_from_auth_json_contents(
     content: &str,
     account_name: String,
 ) -> Result<StoredAccount> {
-    let auth: AuthDotJson =
-        serde_json::from_str(content).context("Failed to parse auth.json contents")?;
+    import_from_auth_json_bytes(content.as_bytes(), account_name)
+        .context("Failed to parse auth.json contents")
+}
+
+fn import_from_auth_json_bytes(bytes: &[u8], account_name: String) -> Result<StoredAccount> {
+    let auth = parse_auth_bytes(bytes)?;
     let AuthDotJson {
         openai_api_key,
         tokens,
         last_refresh,
     } = auth;
 
-    // Determine auth mode and create account
     if let Some(api_key) = openai_api_key {
-        Ok(StoredAccount::new_api_key(account_name, api_key))
-    } else if let Some(tokens) = tokens {
-        // Try to extract email and plan from id_token
-        let (email, plan_type) = parse_id_token_claims(&tokens.id_token);
-
-        Ok(StoredAccount::new_chatgpt_with_last_refresh(
-            account_name,
-            email,
-            plan_type,
-            tokens.id_token,
-            tokens.access_token,
-            tokens.refresh_token,
-            tokens.account_id,
-            last_refresh,
-        ))
-    } else {
-        anyhow::bail!("auth.json contains neither API key nor tokens");
+        return Ok(StoredAccount::new_api_key(account_name, api_key));
     }
+
+    let tokens = tokens.context("Validated ChatGPT auth was missing tokens")?;
+    let (email, plan_type) = parse_id_token_claims(&tokens.id_token);
+    Ok(StoredAccount::new_chatgpt_with_last_refresh(
+        account_name,
+        email,
+        plan_type,
+        tokens.id_token,
+        tokens.access_token,
+        tokens.refresh_token,
+        tokens.account_id,
+        last_refresh,
+    ))
 }
 
-/// Parse claims from a JWT ID token (without validation)
+/// Parse claims from a JWT ID token without validating its signature.
 pub(crate) fn parse_id_token_claims(id_token: &str) -> (Option<String>, Option<String>) {
     let (email, plan_type, _) = parse_id_token_metadata(id_token);
     (email, plan_type)
@@ -185,13 +529,34 @@ pub(crate) fn parse_id_token_account_id(id_token: &str) -> Option<String> {
     parse_id_token_metadata(id_token).2
 }
 
+pub(crate) fn resolved_chatgpt_account_id(
+    explicit_account_id: Option<&str>,
+    id_token: &str,
+) -> Result<Option<String>> {
+    let explicit = explicit_account_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from);
+    let embedded = parse_id_token_account_id(id_token)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+
+    match (explicit, embedded) {
+        (Some(explicit), Some(embedded)) if explicit != embedded => {
+            anyhow::bail!("Explicit and embedded ChatGPT account IDs conflict")
+        }
+        (Some(explicit), _) => Ok(Some(explicit)),
+        (None, Some(embedded)) => Ok(Some(embedded)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
         return (None, None, None);
     }
 
-    // Decode the payload (second part)
     let payload =
         match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1]) {
             Ok(bytes) => bytes,
@@ -199,45 +564,178 @@ fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, O
         };
 
     let json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(v) => v,
+        Ok(value) => value,
         Err(_) => return (None, None, None),
     };
 
-    let email = json.get("email").and_then(|v| v.as_str()).map(String::from);
+    let email = json
+        .get("email")
+        .and_then(|value| value.as_str())
+        .map(String::from);
     let auth_claims = json.get("https://api.openai.com/auth");
     let plan_type = auth_claims
         .and_then(|auth| auth.get("chatgpt_plan_type"))
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .map(String::from);
     let account_id = auth_claims
         .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .map(String::from);
 
     (email, plan_type, account_id)
 }
 
-/// Read the current auth.json file if it exists
+/// Read and strictly validate the current auth.json file if it exists.
 pub fn read_current_auth() -> Result<Option<AuthDotJson>> {
-    let path = get_codex_auth_file()?;
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read auth.json: {}", path.display()))?;
-
-    let auth: AuthDotJson = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse auth.json: {}", path.display()))?;
-
-    Ok(Some(auth))
+    parse_auth_snapshot(&capture_auth_snapshot()?)
 }
 
-/// Check if there is an active Codex login
+/// Check if there is an active Codex login.
 pub fn has_active_login() -> Result<bool> {
-    match read_current_auth()? {
-        Some(auth) => Ok(auth.openai_api_key.is_some() || auth.tokens.is_some()),
-        None => Ok(false),
+    Ok(read_current_auth()?.is_some())
+}
+
+#[cfg(test)]
+pub(crate) fn write_auth_for_test(account: &StoredAccount) -> Result<()> {
+    let expected = capture_auth_snapshot()?;
+    let desired = auth_snapshot_for_account(account)?;
+    stage_auth_publication(&expected, &desired)?.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn id_token(email: &str, account_id: Option<&str>) -> String {
+        let auth = account_id
+            .map(|id| serde_json::json!({ "chatgpt_account_id": id, "chatgpt_plan_type": "plus" }))
+            .unwrap_or_else(|| serde_json::json!({ "chatgpt_plan_type": "plus" }));
+        let payload = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": auth,
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize claims"));
+        format!("header.{encoded}.signature")
+    }
+
+    fn chatgpt_account(name: &str, account_id: Option<&str>) -> StoredAccount {
+        StoredAccount::new_chatgpt_with_last_refresh(
+            name.to_string(),
+            Some("shared@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("shared@example.com", account_id),
+            "access-stored".to_string(),
+            "refresh-stored".to_string(),
+            account_id.map(String::from),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        )
+    }
+
+    fn snapshot_for_auth(auth: &AuthDotJson) -> AuthSnapshot {
+        AuthSnapshot {
+            file: FileSnapshot::present(serde_json::to_vec(auth).expect("serialize auth")),
+        }
+    }
+
+    #[test]
+    fn exact_bundle_resolves_without_timestamps() {
+        let mut account = chatgpt_account("Exact", Some("acct-one"));
+        if let AuthData::ChatGPT { last_refresh, .. } = &mut account.auth_data {
+            *last_refresh = None;
+        }
+        let auth = create_auth_json(&account).expect("create auth");
+        let mut store = AccountsStore {
+            accounts: vec![account.clone()],
+            ..AccountsStore::default()
+        };
+
+        let outcome = reconcile_live_auth(&mut store, &snapshot_for_auth(&auth)).expect("resolve");
+
+        assert!(outcome.state == LiveAuthState::Exact);
+        assert_eq!(
+            outcome.matched_account_id.as_deref(),
+            Some(account.id.as_str())
+        );
+    }
+
+    #[test]
+    fn changed_bundle_without_stable_identity_does_not_fall_back_to_email() {
+        let account = chatgpt_account("Stored", None);
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: id_token("shared@example.com", None),
+                access_token: "access-live".to_string(),
+                refresh_token: "refresh-live".to_string(),
+                account_id: None,
+            }),
+            last_refresh: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-21T00:00:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        };
+        let mut store = AccountsStore {
+            accounts: vec![account],
+            ..AccountsStore::default()
+        };
+
+        let error = reconcile_live_auth(&mut store, &snapshot_for_auth(&auth))
+            .err()
+            .expect("identity-less change should fail");
+
+        assert!(error.to_string().contains("no stable ChatGPT account ID"));
+    }
+
+    #[test]
+    fn changed_bundle_with_equal_timestamp_is_blocked() {
+        let account = chatgpt_account("Stored", Some("acct-one"));
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: id_token("shared@example.com", Some("acct-one")),
+                access_token: "access-live".to_string(),
+                refresh_token: "refresh-live".to_string(),
+                account_id: Some("acct-one".to_string()),
+            }),
+            last_refresh: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        };
+        let mut store = AccountsStore {
+            accounts: vec![account],
+            ..AccountsStore::default()
+        };
+
+        let error = reconcile_live_auth(&mut store, &snapshot_for_auth(&auth))
+            .err()
+            .expect("equal timestamp should fail");
+
+        assert!(error.to_string().contains("unchanged refresh timestamp"));
+    }
+
+    #[test]
+    fn mixed_auth_modes_are_rejected() {
+        let auth = AuthDotJson {
+            openai_api_key: Some("sk-test".to_string()),
+            tokens: Some(TokenData {
+                id_token: id_token("user@example.com", Some("acct-one")),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct-one".to_string()),
+            }),
+            last_refresh: None,
+        };
+
+        assert!(validate_auth_dot_json(&auth).is_err());
     }
 }

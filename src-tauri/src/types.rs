@@ -93,6 +93,7 @@ impl StoredAccount {
     }
 
     /// Create a ChatGPT account while preserving the credential refresh time.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_chatgpt_with_last_refresh(
         name: String,
         email: Option<String>,

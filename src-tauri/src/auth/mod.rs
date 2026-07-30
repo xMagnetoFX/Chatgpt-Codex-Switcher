@@ -1,5 +1,6 @@
 //! Authentication module
 
+pub(crate) mod atomic_file;
 pub mod backup_key;
 pub mod oauth_server;
 pub mod storage;

@@ -6,7 +6,9 @@ use chrono::Utc;
 use futures::future::BoxFuture;
 use tokio::time::{sleep, Duration};
 
-use super::update_account_chatgpt_tokens_after_refresh;
+use super::storage::{
+    chatgpt_credential_fingerprint, update_account_chatgpt_tokens_after_refresh, ChatGptTokenUpdate,
+};
 use crate::types::{AuthData, StoredAccount};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
@@ -38,8 +40,10 @@ impl ChatGptTokenRefreshClient for HttpChatGptTokenRefreshClient {
     }
 }
 
-/// Ensure the account has a non-expired ChatGPT access token.
-/// Returns an updated account when a refresh was performed.
+/// Ensure an account has a demonstrably fresh ChatGPT access token.
+/// Inactive accounts update only the catalog. If the same account is currently
+/// live in Codex, the refreshed credentials are committed to both files without
+/// changing account identity.
 pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<StoredAccount> {
     ensure_chatgpt_tokens_fresh_with_client(account, &HttpChatGptTokenRefreshClient).await
 }
@@ -51,7 +55,8 @@ pub(crate) async fn ensure_chatgpt_tokens_fresh_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    ensure_chatgpt_tokens_fresh_with_client_and_sync(account, client, true).await
+    let account = latest_catalog_account(account)?;
+    ensure_catalog_account_fresh_with_client(account, client).await
 }
 
 pub(crate) async fn ensure_chatgpt_tokens_fresh_for_activation_with_client<C>(
@@ -61,34 +66,50 @@ pub(crate) async fn ensure_chatgpt_tokens_fresh_for_activation_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    ensure_chatgpt_tokens_fresh_with_client_and_sync(account, client, false).await
+    // Activation already captured and reconciled its expected live-auth snapshot.
+    // Reconcile again only inside the refresh CAS commit, otherwise a later
+    // process-guard failure could persist the target as active before activation.
+    let account = current_catalog_account(account)?;
+    ensure_catalog_account_fresh_with_client(account, client).await
 }
 
-async fn ensure_chatgpt_tokens_fresh_with_client_and_sync<C>(
-    account: &StoredAccount,
+async fn ensure_catalog_account_fresh_with_client<C>(
+    account: StoredAccount,
     client: &C,
-    sync_active_auth: bool,
 ) -> Result<StoredAccount>
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    match &account.auth_data {
-        AuthData::ApiKey { .. } => Ok(account.clone()),
-        AuthData::ChatGPT { access_token, .. } => {
-            if token_expired_or_near_expiry(access_token) {
-                println!(
-                    "[Auth] Access token expired/near expiry for account {}, refreshing",
-                    account.name
-                );
-                refresh_chatgpt_tokens_with_client_and_sync(account, client, sync_active_auth).await
-            } else {
-                Ok(account.clone())
-            }
-        }
+    if !account_needs_refresh(&account)? {
+        super::switcher::validate_stored_account_credentials(&account)?;
+        return Ok(account);
     }
+
+    println!(
+        "[Auth] Credentials require refresh for account {}",
+        account.name
+    );
+    let expected_credentials = chatgpt_credential_fingerprint(&account)?;
+    let refreshed = refresh_detached_chatgpt_tokens_with_client(&account, client).await?;
+    let (id_token, access_token, refresh_token, account_id, email, plan_type) =
+        refreshed_catalog_fields(&refreshed)?;
+
+    update_account_chatgpt_tokens_after_refresh(
+        &account.id,
+        &expected_credentials,
+        ChatGptTokenUpdate {
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            email,
+            plan_type,
+            last_refresh: Some(Utc::now()),
+        },
+    )
 }
 
-/// Force-refresh ChatGPT OAuth tokens for an account.
+/// Force-refresh an account, updating live auth only for the same active identity.
 pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAccount> {
     refresh_chatgpt_tokens_with_client(account, &HttpChatGptTokenRefreshClient).await
 }
@@ -100,19 +121,39 @@ pub(crate) async fn refresh_chatgpt_tokens_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
-    refresh_chatgpt_tokens_with_client_and_sync(account, client, true).await
+    let account = latest_catalog_account(account)?;
+    let expected_credentials = chatgpt_credential_fingerprint(&account)?;
+    let refreshed = refresh_detached_chatgpt_tokens_with_client(&account, client).await?;
+    let (id_token, access_token, refresh_token, account_id, email, plan_type) =
+        refreshed_catalog_fields(&refreshed)?;
+
+    update_account_chatgpt_tokens_after_refresh(
+        &account.id,
+        &expected_credentials,
+        ChatGptTokenUpdate {
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            email,
+            plan_type,
+            last_refresh: Some(Utc::now()),
+        },
+    )
 }
 
-async fn refresh_chatgpt_tokens_with_client_and_sync<C>(
+pub(crate) async fn refresh_detached_chatgpt_tokens_with_client<C>(
     account: &StoredAccount,
     client: &C,
-    sync_active_auth: bool,
 ) -> Result<StoredAccount>
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
     let (current_id_token, current_refresh_token, current_account_id) = match &account.auth_data {
-        AuthData::ApiKey { .. } => return Ok(account.clone()),
+        AuthData::ApiKey { .. } => {
+            super::switcher::validate_stored_account_credentials(account)?;
+            return Ok(account.clone());
+        }
         AuthData::ChatGPT {
             id_token,
             refresh_token,
@@ -121,32 +162,133 @@ where
         } => (id_token.clone(), refresh_token.clone(), account_id.clone()),
     };
 
-    if current_refresh_token.is_empty() {
+    if current_refresh_token.trim().is_empty() {
         anyhow::bail!("Missing refresh token for account {}", account.name);
     }
+    let current_identity = super::switcher::resolved_chatgpt_account_id(
+        current_account_id.as_deref(),
+        &current_id_token,
+    )
+    .with_context(|| {
+        format!(
+            "Account '{}' has conflicting ChatGPT account IDs",
+            account.name
+        )
+    })?;
 
     let refreshed = client.refresh(&current_refresh_token).await?;
+    if refreshed.access_token.trim().is_empty() {
+        anyhow::bail!("Token refresh returned an empty access token");
+    }
+    if refreshed
+        .refresh_token
+        .as_ref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        anyhow::bail!("Token refresh returned an empty refresh token");
+    }
+
     let next_id_token = refreshed.id_token.unwrap_or(current_id_token);
     let next_refresh_token = refreshed
         .refresh_token
         .unwrap_or_else(|| current_refresh_token.clone());
+    if next_id_token.trim().is_empty() {
+        anyhow::bail!("Token refresh did not provide an ID token");
+    }
+    if !jwt_payload_is_json(&next_id_token) {
+        anyhow::bail!("Token refresh returned a malformed ID token");
+    }
+    if token_expired_or_near_expiry(&refreshed.access_token) {
+        anyhow::bail!("Token refresh returned an expired or malformed access token");
+    }
 
-    let (email, plan_type, parsed_account_id) = parse_id_token_claims(&next_id_token);
-    let next_account_id = parsed_account_id.or(current_account_id);
-
-    let updated = update_account_chatgpt_tokens_after_refresh(
-        &account.id,
-        &current_refresh_token,
-        next_id_token,
-        refreshed.access_token,
-        next_refresh_token,
-        next_account_id,
-        email,
-        plan_type,
-        sync_active_auth,
-    )?;
-
+    let (email, plan_type) = super::switcher::parse_id_token_claims(&next_id_token);
+    let refreshed_identity = super::switcher::resolved_chatgpt_account_id(None, &next_id_token)?;
+    if current_identity.is_some()
+        && refreshed_identity.is_some()
+        && current_identity != refreshed_identity
+    {
+        anyhow::bail!("Token refresh returned credentials for a different ChatGPT account");
+    }
+    let next_account_id = current_identity.or(refreshed_identity);
+    let mut updated = account.clone();
+    updated.email = email.or(updated.email);
+    updated.plan_type = plan_type.or(updated.plan_type);
+    updated.auth_data = AuthData::ChatGPT {
+        id_token: next_id_token,
+        access_token: refreshed.access_token,
+        refresh_token: next_refresh_token,
+        account_id: next_account_id,
+        last_refresh: Some(Utc::now()),
+    };
+    super::switcher::validate_stored_account_credentials(&updated)?;
     Ok(updated)
+}
+
+fn latest_catalog_account(account: &StoredAccount) -> Result<StoredAccount> {
+    super::storage::reconcile_current_auth_catalog()?;
+    current_catalog_account(account)
+}
+
+fn current_catalog_account(account: &StoredAccount) -> Result<StoredAccount> {
+    Ok(super::storage::get_account(&account.id)?.unwrap_or_else(|| account.clone()))
+}
+
+fn account_needs_refresh(account: &StoredAccount) -> Result<bool> {
+    match &account.auth_data {
+        AuthData::ApiKey { key } => {
+            if key.trim().is_empty() {
+                anyhow::bail!("Missing API key for account {}", account.name);
+            }
+            Ok(false)
+        }
+        AuthData::ChatGPT {
+            id_token,
+            access_token,
+            refresh_token,
+            ..
+        } => {
+            if refresh_token.trim().is_empty() {
+                anyhow::bail!("Missing refresh token for account {}", account.name);
+            }
+            Ok(id_token.trim().is_empty()
+                || !jwt_payload_is_json(id_token)
+                || access_token.trim().is_empty()
+                || token_expired_or_near_expiry(access_token))
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn refreshed_catalog_fields(
+    account: &StoredAccount,
+) -> Result<(
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    let AuthData::ChatGPT {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+        ..
+    } = &account.auth_data
+    else {
+        anyhow::bail!("Account is not using ChatGPT OAuth");
+    };
+
+    Ok((
+        id_token.clone(),
+        access_token.clone(),
+        refresh_token.clone(),
+        account_id.clone(),
+        account.email.clone(),
+        account.plan_type.clone(),
+    ))
 }
 
 /// Build a new ChatGPT account from a refresh token.
@@ -159,22 +301,17 @@ pub async fn create_chatgpt_account_from_refresh_token(
         anyhow::bail!("Missing refresh token for account {account_name}");
     }
 
-    let refreshed = refresh_tokens_with_refresh_token(&refresh_token).await?;
-    let id_token = refreshed
-        .id_token
-        .context("Refresh response did not include id_token")?;
-    let next_refresh_token = refreshed.refresh_token.unwrap_or(refresh_token);
-    let (email, plan_type, account_id) = parse_id_token_claims(&id_token);
-
-    Ok(StoredAccount::new_chatgpt(
+    let placeholder = StoredAccount::new_chatgpt_with_last_refresh(
         account_name,
-        email,
-        plan_type,
-        id_token,
-        refreshed.access_token,
-        next_refresh_token,
-        account_id,
-    ))
+        None,
+        None,
+        String::new(),
+        String::new(),
+        refresh_token,
+        None,
+        None,
+    );
+    refresh_detached_chatgpt_tokens_with_client(&placeholder, &HttpChatGptTokenRefreshClient).await
 }
 
 fn token_expired_or_near_expiry(access_token: &str) -> bool {
@@ -182,6 +319,18 @@ fn token_expired_or_near_expiry(access_token: &str) -> bool {
         Some(expiry) => expiry <= Utc::now().timestamp() + EXPIRY_SKEW_SECONDS,
         None => true,
     }
+}
+
+fn jwt_payload_is_json(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()
+        .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+        .is_some()
 }
 
 fn parse_jwt_exp(token: &str) -> Option<i64> {
@@ -195,36 +344,6 @@ fn parse_jwt_exp(token: &str) -> Option<i64> {
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
     json.get("exp").and_then(|v| v.as_i64())
-}
-
-fn parse_id_token_claims(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let parts: Vec<&str> = id_token.split('.').collect();
-    if parts.len() != 3 {
-        return (None, None, None);
-    }
-
-    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-        Ok(bytes) => bytes,
-        Err(_) => return (None, None, None),
-    };
-
-    let json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(v) => v,
-        Err(_) => return (None, None, None),
-    };
-
-    let email = json.get("email").and_then(|v| v.as_str()).map(String::from);
-    let auth_claims = json.get("https://api.openai.com/auth");
-    let plan_type = auth_claims
-        .and_then(|auth| auth.get("chatgpt_plan_type"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let account_id = auth_claims
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    (email, plan_type, account_id)
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
@@ -285,7 +404,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::auth::{add_account, get_account, read_current_auth};
+    use crate::auth::switcher::{get_codex_auth_file, read_current_auth, write_auth_for_test};
+    use crate::auth::{add_account, get_account};
 
     enum FakeOutcome {
         Success(RefreshTokenResponse),
@@ -328,6 +448,23 @@ mod tests {
                     FakeOutcome::Success(response) => Ok(response.clone()),
                     FakeOutcome::Failure(message) => anyhow::bail!(*message),
                 }
+            })
+        }
+    }
+
+    struct LiveUpdateDuringRefresh {
+        live_account: StoredAccount,
+        response: RefreshTokenResponse,
+    }
+
+    impl ChatGptTokenRefreshClient for LiveUpdateDuringRefresh {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> BoxFuture<'a, Result<RefreshTokenResponse>> {
+            Box::pin(async move {
+                write_auth_for_test(&self.live_account)?;
+                Ok(self.response.clone())
             })
         }
     }
@@ -413,8 +550,11 @@ mod tests {
         assert!(!token_expired_or_near_expiry(&jwt_with_expiry(now + 120)));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fresh_access_token_does_not_call_refresh_client() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
         let account = account_with_access_token(jwt_with_expiry(Utc::now().timestamp() + 3600));
         let client = FakeRefreshClient::failure("refresh must not be called");
 
@@ -428,13 +568,36 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn expired_access_token_refreshes_storage_and_active_auth() {
+    async fn fresh_access_token_with_missing_refresh_token_is_rejected() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let mut account = account_with_access_token(jwt_with_expiry(Utc::now().timestamp() + 3600));
+        if let AuthData::ChatGPT { refresh_token, .. } = &mut account.auth_data {
+            *refresh_token = "   ".to_string();
+        }
+        let client = FakeRefreshClient::failure("refresh must not be called");
+
+        let error = match ensure_chatgpt_tokens_fresh_with_client(&account, &client).await {
+            Ok(_) => panic!("missing refresh token should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(client.call_count(), 0);
+        assert!(error.to_string().contains("Missing refresh token"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn expired_live_access_token_refreshes_catalog_and_same_identity_auth() {
         let _guard = crate::test_support::env_lock();
         let _env = TestEnv::new();
         let account = add_account(account_with_access_token(jwt_with_expiry(
             Utc::now().timestamp() - 60,
         )))
         .expect("add account");
+        write_auth_for_test(&account).expect("write live auth");
+        let auth_path = get_codex_auth_file().expect("auth path");
+        let auth_before = std::fs::read(&auth_path).expect("read live auth");
         let client = FakeRefreshClient::success(RefreshTokenResponse {
             id_token: Some(id_token("user@example.com", "acct-one")),
             access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
@@ -458,14 +621,183 @@ mod tests {
                 ..
             } if refresh_token == "refresh-new"
         ));
-        let auth = read_current_auth()
-            .expect("read auth")
-            .expect("auth should exist");
+        assert_ne!(
+            std::fs::read(&auth_path).expect("read live auth after refresh"),
+            auth_before
+        );
+        let live = read_current_auth()
+            .expect("read live auth")
+            .expect("live auth should exist");
         assert_eq!(
-            auth.tokens.expect("tokens should exist").refresh_token,
+            live.tokens.expect("live ChatGPT tokens").refresh_token,
             "refresh-new"
         );
-        assert!(auth.last_refresh.is_some());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn same_refresh_token_live_update_wins_over_in_flight_response() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let account = add_account(account_with_access_token(jwt_with_expiry(
+            Utc::now().timestamp() - 60,
+        )))
+        .expect("add account");
+        write_auth_for_test(&account).expect("write initial live auth");
+        let mut external = account.clone();
+        external.auth_data = AuthData::ChatGPT {
+            id_token: id_token("user@example.com", "acct-one"),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 1800),
+            refresh_token: "refresh-old".to_string(),
+            account_id: Some("acct-one".to_string()),
+            last_refresh: Some(Utc::now()),
+        };
+        let client = LiveUpdateDuringRefresh {
+            live_account: external.clone(),
+            response: RefreshTokenResponse {
+                id_token: Some(id_token("user@example.com", "acct-one")),
+                access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+                refresh_token: None,
+            },
+        };
+
+        let winner = ensure_chatgpt_tokens_fresh_with_client(&account, &client)
+            .await
+            .expect("external live update should win");
+
+        let expected_access = match &external.auth_data {
+            AuthData::ChatGPT { access_token, .. } => access_token,
+            AuthData::ApiKey { .. } => unreachable!(),
+        };
+        assert!(matches!(
+            winner.auth_data,
+            AuthData::ChatGPT { ref access_token, .. } if access_token == expected_access
+        ));
+        let stored = get_account(&account.id)
+            .expect("load account")
+            .expect("account exists");
+        assert!(matches!(
+            stored.auth_data,
+            AuthData::ChatGPT { ref access_token, .. } if access_token == expected_access
+        ));
+        let live = read_current_auth()
+            .expect("read live auth")
+            .expect("live auth exists");
+        assert!(matches!(
+            live.tokens,
+            Some(crate::types::TokenData { ref access_token, .. })
+                if access_token == expected_access
+        ));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn legacy_live_account_without_timestamps_refreshes_both_files() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let mut legacy = account_with_access_token(jwt_with_expiry(Utc::now().timestamp() - 60));
+        if let AuthData::ChatGPT { last_refresh, .. } = &mut legacy.auth_data {
+            *last_refresh = None;
+        }
+        let legacy = add_account(legacy).expect("add legacy account");
+        write_auth_for_test(&legacy).expect("write legacy live auth");
+        let client = FakeRefreshClient::success(RefreshTokenResponse {
+            id_token: Some(id_token("user@example.com", "acct-one")),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+            refresh_token: Some("refresh-new".to_string()),
+        });
+
+        ensure_chatgpt_tokens_fresh_with_client(&legacy, &client)
+            .await
+            .expect("refresh legacy live account");
+
+        let stored = get_account(&legacy.id)
+            .expect("load account")
+            .expect("account should exist");
+        assert!(matches!(
+            stored.auth_data,
+            AuthData::ChatGPT {
+                ref refresh_token,
+                last_refresh: Some(_),
+                ..
+            } if refresh_token == "refresh-new"
+        ));
+        let live = read_current_auth()
+            .expect("read live auth")
+            .expect("live auth should exist");
+        assert_eq!(
+            live.tokens.expect("live ChatGPT tokens").refresh_token,
+            "refresh-new"
+        );
+        assert!(live.last_refresh.is_some());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn expired_background_account_refresh_leaves_other_live_auth_unchanged() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let live = add_account(StoredAccount::new_api_key(
+            "Live".to_string(),
+            "sk-live".to_string(),
+        ))
+        .expect("add live account");
+        write_auth_for_test(&live).expect("write live auth");
+        let background = add_account(account_with_access_token(jwt_with_expiry(
+            Utc::now().timestamp() - 60,
+        )))
+        .expect("add background account");
+        let auth_path = get_codex_auth_file().expect("auth path");
+        let auth_before = std::fs::read(&auth_path).expect("read live auth");
+        let client = FakeRefreshClient::success(RefreshTokenResponse {
+            id_token: Some(id_token("user@example.com", "acct-one")),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+            refresh_token: Some("refresh-new".to_string()),
+        });
+
+        ensure_chatgpt_tokens_fresh_with_client(&background, &client)
+            .await
+            .expect("refresh background account");
+
+        assert_eq!(
+            std::fs::read(auth_path).expect("read live auth after refresh"),
+            auth_before
+        );
+        let stored = get_account(&background.id)
+            .expect("load background")
+            .expect("background should exist");
+        assert!(matches!(
+            stored.auth_data,
+            AuthData::ChatGPT {
+                refresh_token,
+                ..
+            } if refresh_token == "refresh-new"
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_credentials_for_a_different_chatgpt_account() {
+        let account = account_with_access_token(jwt_with_expiry(Utc::now().timestamp() - 60));
+        let client = FakeRefreshClient::success(RefreshTokenResponse {
+            id_token: Some(id_token("other@example.com", "acct-other")),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+            refresh_token: Some("refresh-new".to_string()),
+        });
+
+        let error = refresh_detached_chatgpt_tokens_with_client(&account, &client)
+            .await
+            .expect_err("identity drift should fail");
+
+        assert_eq!(client.call_count(), 1);
+        assert!(error.to_string().contains("different ChatGPT account"));
+        assert!(matches!(
+            account.auth_data,
+            AuthData::ChatGPT {
+                ref refresh_token,
+                ref account_id,
+                ..
+            } if refresh_token == "refresh-old" && account_id.as_deref() == Some("acct-one")
+        ));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -477,12 +809,9 @@ mod tests {
             Utc::now().timestamp() - 60,
         )))
         .expect("add account");
-        let auth_before = serde_json::to_value(
-            read_current_auth()
-                .expect("read auth")
-                .expect("auth should exist"),
-        )
-        .expect("serialize auth");
+        write_auth_for_test(&account).expect("write live auth");
+        let auth_path = get_codex_auth_file().expect("auth path");
+        let auth_before = std::fs::read(&auth_path).expect("read live auth");
         let client = FakeRefreshClient::failure("provider rejected refresh");
 
         let result = ensure_chatgpt_tokens_fresh_with_client(&account, &client).await;
@@ -496,12 +825,9 @@ mod tests {
             stored.auth_data,
             AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-old"
         ));
-        let auth_after = serde_json::to_value(
-            read_current_auth()
-                .expect("read auth")
-                .expect("auth should exist"),
-        )
-        .expect("serialize auth");
-        assert_eq!(auth_after, auth_before);
+        assert_eq!(
+            std::fs::read(auth_path).expect("read live auth after failure"),
+            auth_before
+        );
     }
 }
