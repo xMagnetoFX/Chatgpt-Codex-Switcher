@@ -8,7 +8,7 @@ use crate::auth::{
 use crate::commands::activation::{
     activate_existing_account_with_client, add_imported_account_with_client,
     delete_account_with_client, merge_imported_accounts_with_client,
-    persist_imported_account_catalog_only,
+    persist_restored_accounts_catalog_only, CatalogRestoreOutcome, RestoredCatalogAccount,
 };
 use crate::commands::process::{
     prepare_codex_restart_plan, start_codex_from_restart_plan, stop_codex_for_restart,
@@ -29,6 +29,9 @@ use sha2::Sha256;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
+use std::sync::LazyLock;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 const SLIM_EXPORT_PREFIX: &str = "css1.";
 const SLIM_FORMAT_VERSION: u8 = 1;
@@ -47,6 +50,8 @@ const LEGACY_FULL_PRESET_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE
 const MAX_IMPORT_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const SLIM_IMPORT_CONCURRENCY: usize = 6;
+
+static RESTART_SWITCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SlimPayload {
@@ -163,6 +168,7 @@ async fn restart_codex_and_switch_account_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    let _restart_guard = RESTART_SWITCH_LOCK.lock().await;
     let restart_plan = tokio::task::spawn_blocking(move || {
         let restart_plan = prepare_codex_restart_plan().map_err(|e| e.to_string())?;
         stop_codex_for_restart(&restart_plan).map_err(|e| e.to_string())?;
@@ -217,20 +223,16 @@ pub async fn export_accounts_slim_text() -> Result<String, String> {
 pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccountsSummary, String> {
     let slim_payload = decode_slim_payload(&payload).map_err(|e| format!("{e:#}"))?;
     let total_in_payload = slim_payload.accounts.len();
-
     let current = load_accounts().map_err(|e| e.to_string())?;
-    let existing_names: HashSet<String> = current.accounts.iter().map(|a| a.name.clone()).collect();
 
-    let imported = build_store_from_slim_payload(slim_payload, &existing_names)
+    let imported = build_store_from_slim_payload(slim_payload, &current)
         .await
         .map_err(|e| {
             format!(
-                "{e:#}\nHint: Slim import needs network access to refresh ChatGPT tokens. Successfully restored accounts are saved immediately so rotated credentials are not lost."
+                "{e:#}\nHint: Slim import needs network access to refresh ChatGPT tokens. No catalog changes are saved unless every account is restored successfully."
             )
         })?;
-    validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let imported_count = imported.accounts.len();
     reconcile_current_auth_catalog().map_err(|error| {
         format!(
             "Imported accounts were saved, but live credentials could not be reconciled: {error:#}"
@@ -238,12 +240,16 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
     })?;
     let latest = load_accounts().map_err(|e| e.to_string())?;
     if latest.active_account_id.is_none() {
-        if let Some(target_id) = imported.active_account_id.as_deref().filter(|target_id| {
-            latest
-                .accounts
-                .iter()
-                .any(|account| account.id.as_str() == *target_id)
-        }) {
+        if let Some(target_id) = imported
+            .activation_target_id
+            .as_deref()
+            .filter(|target_id| {
+                latest
+                    .accounts
+                    .iter()
+                    .any(|account| account.id.as_str() == *target_id)
+            })
+        {
             activate_existing_account_with_client(target_id, &HttpChatGptTokenRefreshClient)
                 .await
                 .map_err(|e| {
@@ -256,8 +262,8 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
 
     Ok(ImportAccountsSummary {
         total_in_payload,
-        imported_count,
-        skipped_count: total_in_payload.saturating_sub(imported_count),
+        imported_count: imported.changed_count,
+        skipped_count: total_in_payload.saturating_sub(imported.changed_count),
     })
 }
 
@@ -379,6 +385,8 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
     }
 
     let mut names = HashSet::new();
+    let mut api_keys = HashSet::new();
+    let mut refresh_tokens = HashSet::new();
 
     for account in &payload.accounts {
         if account.name.trim().is_empty() {
@@ -394,21 +402,29 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
 
         match account.auth_type {
             SLIM_AUTH_API_KEY => {
-                if account
+                let key = account
                     .api_key
-                    .as_ref()
-                    .is_none_or(|key| key.trim().is_empty())
-                {
-                    anyhow::bail!("API key is missing for account {}", account.name);
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .with_context(|| format!("API key is missing for account {}", account.name))?;
+                if !api_keys.insert(key) {
+                    anyhow::bail!(
+                        "Slim import contains more than one account with the same API key"
+                    );
                 }
             }
             SLIM_AUTH_CHATGPT => {
-                if account
+                let refresh_token = account
                     .refresh_token
-                    .as_ref()
-                    .is_none_or(|token| token.trim().is_empty())
-                {
-                    anyhow::bail!("Refresh token is missing for account {}", account.name);
+                    .as_deref()
+                    .filter(|token| !token.trim().is_empty())
+                    .with_context(|| {
+                        format!("Refresh token is missing for account {}", account.name)
+                    })?;
+                if !refresh_tokens.insert(refresh_token) {
+                    anyhow::bail!(
+                        "Slim import contains more than one account with the same refresh token"
+                    );
                 }
             }
             _ => {
@@ -430,42 +446,105 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct SlimImportResult {
+    changed_count: usize,
+    activation_target_id: Option<String>,
+}
+
+struct ExistingSlimAccount {
+    source_name: String,
+    account_id: String,
+}
+
+struct RestoredSlimAccount {
+    source_name: String,
+    restored: RestoredCatalogAccount,
+}
+
 async fn build_store_from_slim_payload(
     payload: SlimPayload,
-    existing_names: &HashSet<String>,
-) -> anyhow::Result<AccountsStore> {
+    current: &AccountsStore,
+) -> anyhow::Result<SlimImportResult> {
     let active_name = payload.active_name;
-    let import_candidates: Vec<SlimAccountPayload> = payload
-        .accounts
-        .into_iter()
-        .filter(|entry| !existing_names.contains(&entry.name))
-        .collect();
+    let mut existing_matches = Vec::new();
+    let mut import_candidates = Vec::new();
 
-    let accounts = restore_slim_accounts(import_candidates).await?;
-    let mut active_account_id = None;
-
-    if let Some(active) = active_name {
-        active_account_id = accounts
+    for entry in payload.accounts {
+        if let Some(existing) = current
+            .accounts
             .iter()
-            .find(|account| account.name == active)
-            .map(|account| account.id.clone());
+            .find(|account| slim_entry_matches_existing(&entry, account))
+        {
+            existing_matches.push(ExistingSlimAccount {
+                source_name: entry.name,
+                account_id: existing.id.clone(),
+            });
+            continue;
+        }
+
+        // A display name is not credential identity. Restore the entry first so a stale ChatGPT
+        // refresh token can resolve to the same stable account; the atomic catalog merge below
+        // rejects the name if it belongs to a genuinely different login.
+        import_candidates.push(entry);
     }
 
-    if active_account_id.is_none() {
-        active_account_id = accounts.first().map(|a| a.id.clone());
+    let restored = restore_slim_accounts(import_candidates).await?;
+    let inputs = restored
+        .iter()
+        .map(|entry| RestoredCatalogAccount {
+            account: entry.restored.account.clone(),
+            source_refresh_token: entry.restored.source_refresh_token.clone(),
+        })
+        .collect();
+    let outcomes = persist_restored_accounts_catalog_only(inputs)
+        .context("Failed to save restored slim-import accounts")?;
+    let changed_count = outcomes.len();
+
+    let mut activation_target_id = active_name.as_deref().and_then(|name| {
+        existing_matches
+            .iter()
+            .find(|entry| entry.source_name == name)
+            .map(|entry| entry.account_id.clone())
+    });
+    let mut first_changed_id = None;
+    for (restored, outcome) in restored.into_iter().zip(outcomes) {
+        let account = match outcome {
+            CatalogRestoreOutcome::Added(account)
+            | CatalogRestoreOutcome::UpdatedExisting(account) => account,
+        };
+        first_changed_id.get_or_insert_with(|| account.id.clone());
+        if active_name.as_deref() == Some(restored.source_name.as_str()) {
+            activation_target_id = Some(account.id);
+        }
     }
 
-    Ok(AccountsStore {
-        version: 1,
-        accounts,
-        active_account_id,
-        masked_account_ids: Vec::new(),
+    if active_name.is_none() {
+        activation_target_id = first_changed_id.or_else(|| {
+            existing_matches
+                .first()
+                .map(|entry| entry.account_id.clone())
+        });
+    }
+
+    Ok(SlimImportResult {
+        changed_count,
+        activation_target_id,
     })
+}
+
+fn slim_entry_matches_existing(entry: &SlimAccountPayload, existing: &StoredAccount) -> bool {
+    match (entry.auth_type, &existing.auth_data) {
+        (SLIM_AUTH_API_KEY, AuthData::ApiKey { key }) => entry.api_key.as_deref() == Some(key),
+        (SLIM_AUTH_CHATGPT, AuthData::ChatGPT { refresh_token, .. }) => {
+            entry.refresh_token.as_deref() == Some(refresh_token)
+        }
+        _ => false,
+    }
 }
 
 async fn restore_slim_accounts(
     entries: Vec<SlimAccountPayload>,
-) -> anyhow::Result<Vec<StoredAccount>> {
+) -> anyhow::Result<Vec<RestoredSlimAccount>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -473,27 +552,37 @@ async fn restore_slim_accounts(
     let mut restored = Vec::with_capacity(entries.len());
     let mut tasks = stream::iter(entries.into_iter().map(|entry| async move {
         let account_name = entry.name;
-        let account = match entry.auth_type {
-            SLIM_AUTH_API_KEY => StoredAccount::new_api_key(
-                account_name.clone(),
-                entry.api_key.context("API key payload is missing")?,
+        let (account, source_refresh_token) = match entry.auth_type {
+            SLIM_AUTH_API_KEY => (
+                StoredAccount::new_api_key(
+                    account_name.clone(),
+                    entry.api_key.context("API key payload is missing")?,
+                ),
+                None,
             ),
             SLIM_AUTH_CHATGPT => {
                 let refresh_token = entry
                     .refresh_token
                     .context("Refresh token payload is missing")?;
-                create_chatgpt_account_from_refresh_token(account_name.clone(), refresh_token)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to restore ChatGPT account `{account_name}` from refresh token"
-                        )
-                    })?
+                let account = create_chatgpt_account_from_refresh_token(
+                    account_name.clone(),
+                    refresh_token.clone(),
+                )
+                .await
+                .with_context(|| {
+                    format!("Failed to restore ChatGPT account `{account_name}` from refresh token")
+                })?;
+                (account, Some(refresh_token))
             }
             _ => anyhow::bail!("Unsupported auth type in slim payload"),
         };
-        persist_imported_account_catalog_only(account)
-            .with_context(|| format!("Failed to save restored account `{account_name}`"))
+        Ok::<_, anyhow::Error>(RestoredSlimAccount {
+            source_name: account_name,
+            restored: RestoredCatalogAccount {
+                account,
+                source_refresh_token,
+            },
+        })
     }))
     .buffered(SLIM_IMPORT_CONCURRENCY);
 
@@ -1008,6 +1097,145 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn slim_import_rejects_duplicate_refresh_token_sources() {
+        let payload = SlimPayload {
+            version: SLIM_FORMAT_VERSION,
+            active_name: None,
+            accounts: vec![
+                SlimAccountPayload {
+                    name: "First".to_string(),
+                    auth_type: SLIM_AUTH_CHATGPT,
+                    api_key: None,
+                    refresh_token: Some("shared-refresh".to_string()),
+                },
+                SlimAccountPayload {
+                    name: "Second".to_string(),
+                    auth_type: SLIM_AUTH_CHATGPT,
+                    api_key: None,
+                    refresh_token: Some("shared-refresh".to_string()),
+                },
+            ],
+        };
+
+        let error =
+            validate_slim_payload(&payload).expect_err("duplicate refresh token should fail");
+
+        assert!(error.to_string().contains("same refresh token"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn slim_import_keeps_an_existing_selected_account_as_the_activation_target() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let existing =
+            StoredAccount::new_api_key("Existing".to_string(), "sk-existing".to_string());
+        let current = AccountsStore {
+            version: 1,
+            accounts: vec![existing.clone()],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        };
+        crate::auth::save_accounts(&current).expect("save current catalog");
+        let payload = SlimPayload {
+            version: SLIM_FORMAT_VERSION,
+            active_name: Some("Existing".to_string()),
+            accounts: vec![
+                SlimAccountPayload {
+                    name: "Existing".to_string(),
+                    auth_type: SLIM_AUTH_API_KEY,
+                    api_key: Some("sk-existing".to_string()),
+                    refresh_token: None,
+                },
+                SlimAccountPayload {
+                    name: "New".to_string(),
+                    auth_type: SLIM_AUTH_API_KEY,
+                    api_key: Some("sk-new".to_string()),
+                    refresh_token: None,
+                },
+            ],
+        };
+
+        let imported = build_store_from_slim_payload(payload, &current)
+            .await
+            .expect("restore slim payload");
+
+        assert!(imported.activation_target_id.as_deref() == Some(existing.id.as_str()));
+        assert!(imported.changed_count == 1);
+        let stored = load_accounts().expect("load restored catalog");
+        assert!(stored.accounts.iter().any(|account| account.name == "New"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn slim_import_matches_existing_credentials_independently_of_display_name() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let existing =
+            StoredAccount::new_api_key("Local name".to_string(), "sk-existing".to_string());
+        let current = AccountsStore {
+            version: 1,
+            accounts: vec![existing.clone()],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        };
+        crate::auth::save_accounts(&current).expect("save current catalog");
+        let payload = SlimPayload {
+            version: SLIM_FORMAT_VERSION,
+            active_name: Some("Exported name".to_string()),
+            accounts: vec![SlimAccountPayload {
+                name: "Exported name".to_string(),
+                auth_type: SLIM_AUTH_API_KEY,
+                api_key: Some("sk-existing".to_string()),
+                refresh_token: None,
+            }],
+        };
+
+        let imported = build_store_from_slim_payload(payload, &current)
+            .await
+            .expect("match existing credentials");
+
+        assert!(imported.changed_count == 0);
+        assert!(imported.activation_target_id.as_deref() == Some(existing.id.as_str()));
+        let stored = load_accounts().expect("load unchanged catalog");
+        assert!(stored.accounts.len() == 1);
+        assert!(stored.accounts[0].name == "Local name");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn slim_import_rejects_same_name_with_different_credentials() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let existing =
+            StoredAccount::new_api_key("Personal".to_string(), "sk-existing".to_string());
+        let current = AccountsStore {
+            version: 1,
+            accounts: vec![existing],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        };
+        crate::auth::save_accounts(&current).expect("save current catalog");
+        let payload = SlimPayload {
+            version: SLIM_FORMAT_VERSION,
+            active_name: Some("Personal".to_string()),
+            accounts: vec![SlimAccountPayload {
+                name: "Personal".to_string(),
+                auth_type: SLIM_AUTH_API_KEY,
+                api_key: Some("sk-different".to_string()),
+                refresh_token: None,
+            }],
+        };
+
+        let result = build_store_from_slim_payload(payload, &current).await;
+
+        assert!(result.is_err());
+        let stored = load_accounts().expect("load unchanged catalog");
+        assert!(stored.accounts.len() == 1);
+        assert!(stored.active_account_id.is_none());
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn slim_import_activates_from_latest_catalog_state() {
@@ -1119,10 +1347,10 @@ mod tests {
         let auth = read_current_auth()
             .expect("read auth")
             .expect("auth should exist");
-        assert_eq!(
-            auth.tokens.expect("tokens should exist").refresh_token,
-            "refresh-new"
-        );
+        assert!(matches!(
+            auth.tokens,
+            Some(crate::types::TokenData { refresh_token, .. }) if refresh_token == "refresh-new"
+        ));
     }
 
     // These tests intentionally hold the env lock across await to serialize
@@ -1166,7 +1394,7 @@ mod tests {
                 .expect("auth should exist"),
         )
         .expect("serialize auth");
-        assert_eq!(auth_after, auth_before);
+        assert!(auth_after == auth_before, "live auth changed unexpectedly");
         let store = load_accounts().expect("load accounts");
         assert_eq!(
             store.active_account_id.as_deref(),
@@ -1225,7 +1453,7 @@ mod tests {
                 .expect("auth should exist"),
         )
         .expect("serialize auth");
-        assert_eq!(auth_after, auth_before);
+        assert!(auth_after == auth_before, "live auth changed unexpectedly");
         let store = load_accounts().expect("load accounts");
         assert_eq!(
             store.active_account_id.as_deref(),
@@ -1295,6 +1523,9 @@ mod tests {
         let auth = read_current_auth()
             .expect("read auth")
             .expect("auth should exist");
-        assert_eq!(auth.openai_api_key.as_deref(), Some("sk-secondary"));
+        assert!(matches!(
+            auth.openai_api_key.as_deref(),
+            Some("sk-secondary")
+        ));
     }
 }

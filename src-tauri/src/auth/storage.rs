@@ -438,16 +438,61 @@ pub fn update_account_metadata(
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChatGptCredentialFingerprint([u8; 32]);
 
+impl ChatGptCredentialFingerprint {
+    pub(crate) fn encoded(&self) -> String {
+        let mut encoded = String::with_capacity(self.0.len() * 2);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+}
+
 pub(crate) fn chatgpt_credential_fingerprint(
     account: &StoredAccount,
 ) -> Result<ChatGptCredentialFingerprint> {
-    if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
-        anyhow::bail!("Cannot fingerprint OAuth credentials for an API key account");
-    }
+    chatgpt_auth_data_fingerprint(&account.auth_data)
+}
 
-    let encoded = serde_json::to_vec(&account.auth_data)
-        .context("Failed to fingerprint ChatGPT credentials")?;
+pub(crate) fn chatgpt_auth_data_fingerprint(
+    auth_data: &AuthData,
+) -> Result<ChatGptCredentialFingerprint> {
+    let AuthData::ChatGPT {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+        last_refresh,
+    } = auth_data
+    else {
+        anyhow::bail!("Cannot fingerprint OAuth credentials for an API key account");
+    };
+
+    // Normalize the stable identity because legacy auth.json files can carry it only in the
+    // ID token while newer catalog entries also populate the explicit account_id field.
+    let canonical_account_id =
+        super::switcher::resolved_chatgpt_account_id(account_id.as_deref(), id_token)?;
+    let encoded = serde_json::to_vec(&(
+        id_token,
+        access_token,
+        refresh_token,
+        canonical_account_id,
+        last_refresh,
+    ))
+    .context("Failed to fingerprint ChatGPT credentials")?;
     Ok(ChatGptCredentialFingerprint(Sha256::digest(encoded).into()))
+}
+
+pub(crate) fn record_chatgpt_credential_predecessor(account: &mut StoredAccount) -> Result<()> {
+    let predecessor = chatgpt_credential_fingerprint(account)?.encoded();
+    if !account
+        .previous_chatgpt_credential_hashes
+        .contains(&predecessor)
+    {
+        account.previous_chatgpt_credential_hashes.push(predecessor);
+    }
+    Ok(())
 }
 
 pub(crate) struct ChatGptTokenUpdate {
@@ -498,10 +543,9 @@ pub(crate) fn update_account_chatgpt_tokens_after_refresh(
         let accounts_before = capture_accounts_snapshot(&accounts_path)?;
         let auth_before = super::switcher::capture_auth_snapshot()?;
         let mut store = load_accounts_from_path(&accounts_path)?;
-        let reconciliation = super::switcher::reconcile_live_auth(&mut store, &auth_before).ok();
-        let live_account_id = reconciliation
-            .as_ref()
-            .and_then(|outcome| outcome.matched_account_id.as_deref());
+        let reconciliation = super::switcher::reconcile_live_auth(&mut store, &auth_before)?;
+        let live_account_id = reconciliation.matched_account_id.as_deref();
+        let record_predecessor = live_account_id == Some(account_id);
         let account = store
             .accounts
             .iter_mut()
@@ -553,7 +597,7 @@ pub(crate) fn update_account_chatgpt_tokens_after_refresh(
         let update = pending_update
             .take()
             .context("Refreshed credentials were already consumed")?;
-        apply_chatgpt_token_update(account, update)?;
+        apply_chatgpt_token_update(account, update, record_predecessor)?;
         let updated = account.clone();
         super::switcher::validate_catalog_credential_uniqueness(&store)?;
         let desired_store = FileSnapshot::present(serialize_accounts_store(&store)?);
@@ -627,7 +671,10 @@ fn update_account_chatgpt_tokens_with_last_refresh(
                 }
             }
 
-            apply_chatgpt_token_update(account, update)?;
+            // This legacy catalog-only API cannot determine whether the account is live, so keep
+            // the predecessor conservatively. Normal refreshes record history only for the live
+            // account to avoid unbounded growth on inactive accounts.
+            apply_chatgpt_token_update(account, update, true)?;
             account.clone()
         };
         super::switcher::validate_catalog_credential_uniqueness(store)?;
@@ -638,7 +685,11 @@ fn update_account_chatgpt_tokens_with_last_refresh(
 fn apply_chatgpt_token_update(
     account: &mut StoredAccount,
     update: ChatGptTokenUpdate,
+    record_predecessor: bool,
 ) -> Result<()> {
+    if record_predecessor {
+        record_chatgpt_credential_predecessor(account)?;
+    }
     match &mut account.auth_data {
         AuthData::ChatGPT {
             id_token: stored_id_token,

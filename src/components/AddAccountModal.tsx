@@ -35,6 +35,7 @@ export function AddAccountModal({
   const [authUrl, setAuthUrl] = useState<string>("");
   const [copied, setCopied] = useState<boolean>(false);
   const isPrimaryDisabled = loading || (activeTab === "oauth" && oauthPending);
+  const oauthInFlight = activeTab === "oauth" && (loading || oauthPending);
   const tauriRuntime = isTauriRuntime();
   // Bumped whenever a flow is superseded (close, cancel, retry) so an
   // in-flight completeOAuth rejection can't write stale error state later.
@@ -51,7 +52,7 @@ export function AddAccountModal({
   };
 
   const handleClose = () => {
-    if (oauthPending) void onCancelOAuth();
+    if (oauthInFlight) void onCancelOAuth();
     resetForm();
     onClose();
   };
@@ -129,7 +130,7 @@ export function AddAccountModal({
               type="button"
               key={tab}
               onClick={() => {
-                if (tab === "import" && oauthPending) {
+                if (tab === "import" && oauthInFlight) {
                   oauthAttemptRef.current += 1;
                   void onCancelOAuth().catch((err) => console.error("Failed to cancel login:", err));
                   setOauthPending(false);

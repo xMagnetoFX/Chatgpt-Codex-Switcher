@@ -44,11 +44,12 @@ pub(crate) fn read_snapshot(path: &Path) -> Result<FileSnapshot> {
     }
 }
 
-/// Recover an interrupted externally mutable file transaction.
+/// Clean up a recovery sidecar left by an interrupted externally mutable file transaction.
 ///
-/// A missing live path with a recovery sidecar means publication did not
-/// complete, so the previous file is restored. If both paths exist, the live
-/// path won and stale sidecar cleanup is best effort.
+/// In-process publication failures restore through the still-open recovery handle. After a
+/// process interruption, the account catalog remains the durable credential source. Restoring a
+/// fixed sidecar into a missing live path would be unsafe because the live file may have been
+/// deliberately removed by a later sign-out.
 pub(crate) fn recover_externally_mutable_file(path: &Path) -> Result<()> {
     let recovery = recovery_path(path);
     ensure_not_reparse_point(path)?;
@@ -57,25 +58,12 @@ pub(crate) fn recover_externally_mutable_file(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    if path.exists() {
-        let _ = remove_file_if_present(&recovery);
-        return Ok(());
-    }
-
-    match move_file_no_replace(&recovery, path) {
-        Ok(()) => Ok(()),
-        Err(_error) if path.exists() => {
-            let _ = remove_file_if_present(&recovery);
-            Ok(())
-        }
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Failed to recover {} from {}",
-                path.display(),
-                recovery.display()
-            )
-        }),
-    }
+    remove_file_if_present(&recovery).with_context(|| {
+        format!(
+            "Failed to remove stale recovery sidecar for {}",
+            path.display()
+        )
+    })
 }
 
 pub(crate) fn stage_file_change(
@@ -186,6 +174,7 @@ impl StagedFileChange {
 
     #[cfg(windows)]
     fn commit_when_expected_present(&mut self, expected_bytes: Vec<u8>) -> Result<()> {
+        test_external_replacement(&self.path)?;
         let recovery = recovery_path(&self.path);
         let mut guarded = open_guarded_file(&self.path).with_context(|| {
             format!(
@@ -204,24 +193,33 @@ impl StagedFileChange {
             );
         }
 
+        if matches!(self.desired, FileSnapshot::Present(_)) {
+            let staged_path = self
+                .staged_path
+                .take()
+                .context("Staged file was unavailable for publication")?;
+            replace_file_with_backup(staged_path.as_ref(), &self.path, &recovery).with_context(
+                || format!("Failed to atomically publish {}", display_name(self.label)),
+            )?;
+
+            // ReplaceFileW never exposes a missing destination. If sidecar cleanup fails, a later
+            // missing destination means an external sign-out happened after publication, so startup
+            // recovery can safely discard the stale backup instead of resurrecting credentials.
+            let _ = dispose_recovery_handle(&guarded);
+            return Ok(());
+        }
+
         rename_open_file(&guarded, &recovery).with_context(|| {
             format!(
                 "Failed to prepare recovery for {}",
                 display_name(self.label)
             )
         })?;
-
         let publication = self.publish_after_recovery_rename();
         match publication {
             Ok(()) => {
-                if matches!(self.desired, FileSnapshot::Missing) {
-                    if let Err(cleanup_error) = dispose_recovery_handle(&guarded) {
-                        return self.restore_after_failed_publication(&guarded, cleanup_error);
-                    }
-                } else {
-                    // Publication is committed. Sidecar cleanup must not turn a
-                    // successful transaction into a reported failure.
-                    let _ = dispose_recovery_handle(&guarded);
+                if let Err(cleanup_error) = dispose_recovery_handle(&guarded) {
+                    return self.restore_after_failed_publication(&guarded, cleanup_error);
                 }
                 Ok(())
             }
@@ -255,6 +253,7 @@ impl StagedFileChange {
             );
         }
 
+        test_external_replacement(&self.path)?;
         let publication = self.publish_after_recovery_rename();
         match publication {
             Ok(()) => {
@@ -275,7 +274,6 @@ impl StagedFileChange {
     }
 
     fn publish_after_recovery_rename(&mut self) -> Result<()> {
-        test_external_replacement(&self.path)?;
         match &self.desired {
             FileSnapshot::Missing => {
                 if read_snapshot(&self.path)? == FileSnapshot::Missing {
@@ -515,6 +513,48 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     })
 }
 
+#[cfg(windows)]
+fn replace_file_with_backup(
+    source: &Path,
+    destination: &Path,
+    backup: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+    let source_wide: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let backup_wide: Vec<u16> = backup
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            source_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(not(windows))]
 fn move_file_to_recovery(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
@@ -567,12 +607,13 @@ fn open_guarded_file(path: &Path) -> std::io::Result<fs::File> {
 
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
     };
 
     let file = fs::OpenOptions::new()
         .access_mode(GENERIC_READ | DELETE)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -696,15 +737,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interrupted_recovery_restores_the_previous_file() {
+    fn interrupted_recovery_does_not_restore_a_login() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("auth.json");
         let recovery = recovery_path(&path);
         fs::write(&recovery, b"previous").expect("write recovery");
 
-        recover_externally_mutable_file(&path).expect("recover file");
+        recover_externally_mutable_file(&path).expect("clean interrupted recovery");
 
-        assert_eq!(fs::read(path).expect("read restored file"), b"previous");
+        assert!(!path.exists());
         assert!(!recovery.exists());
     }
 
@@ -718,11 +759,11 @@ mod tests {
 
         recover_externally_mutable_file(&path).expect("recover file");
 
-        assert_eq!(fs::read(path).expect("read live file"), b"live");
+        assert!(fs::read(path).expect("read live file") == b"live");
     }
 
     #[test]
-    fn cleanup_failure_after_publication_does_not_report_commit_failure() {
+    fn cleanup_failure_after_publication_cannot_resurrect_auth_after_sign_out() {
         let _guard = crate::test_support::env_lock();
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("auth.json");
@@ -740,8 +781,10 @@ mod tests {
 
         std::env::remove_var("CODEX_SWITCHER_TEST_ATOMIC_FAIL");
         assert!(result.is_ok());
-        assert_eq!(fs::read(&path).expect("read published file"), b"desired");
+        assert!(fs::read(&path).expect("read published file") == b"desired");
+        fs::remove_file(&path).expect("simulate sign-out");
         recover_externally_mutable_file(&path).expect("clean stale recovery");
+        assert!(!path.exists());
         assert!(!recovery_path(&path).exists());
     }
 
@@ -772,7 +815,7 @@ mod tests {
         writer.seek(SeekFrom::Start(0)).expect("rewind writer");
         writer.write_all(b"external").expect("write externally");
         writer.sync_all().expect("sync external write");
-        assert_eq!(fs::read(path).expect("read external write"), b"external");
+        assert!(fs::read(path).expect("read external write") == b"external");
     }
 
     #[cfg(windows)]
@@ -801,7 +844,7 @@ mod tests {
         .commit();
 
         assert!(result.is_err());
-        assert_eq!(fs::read(&target).expect("read target"), b"previous");
+        assert!(fs::read(&target).expect("read target") == b"previous");
         assert!(fs::symlink_metadata(&path)
             .expect("read link metadata")
             .file_type()

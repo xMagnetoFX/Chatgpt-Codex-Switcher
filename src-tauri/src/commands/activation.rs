@@ -1,5 +1,7 @@
 //! Guarded account activation transactions.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 
 use crate::auth::atomic_file::{stage_file_change, FileSnapshot};
@@ -11,7 +13,8 @@ use crate::auth::storage::{
 use crate::auth::{
     auth_snapshot_for_account, auth_snapshot_matches_current, capture_auth_snapshot,
     ensure_chatgpt_tokens_fresh_for_activation_with_client, missing_auth_snapshot,
-    reconcile_live_auth, rollback_auth_publication, stage_auth_publication,
+    reconcile_live_auth, record_chatgpt_credential_predecessor, resolved_chatgpt_account_id,
+    rollback_auth_publication, stage_auth_publication, stored_accounts_share_credentials,
     validate_stored_account_credentials, AuthSnapshot, ChatGptTokenRefreshClient,
 };
 use crate::commands::process::{ensure_switch_allowed, restart_antigravity_background_processes};
@@ -31,6 +34,18 @@ pub(crate) async fn activate_existing_account_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    activate_existing_account_with_client_inner(account_id, client, None).await
+}
+
+async fn activate_existing_account_with_client_inner<C>(
+    account_id: &str,
+    client: &C,
+    cancelled: Option<&AtomicBool>,
+) -> Result<()>
+where
+    C: ChatGptTokenRefreshClient + ?Sized,
+{
+    ensure_not_cancelled(cancelled)?;
     let prepared = prepare_catalog(true)?;
     let account = prepared
         .store
@@ -43,6 +58,7 @@ where
     let fresh = ensure_chatgpt_tokens_fresh_for_activation_with_client(&account, client)
         .await
         .with_context(|| format!("Failed to refresh account '{}'", account.name))?;
+    ensure_not_cancelled(cancelled)?;
     let activation_snapshot = capture_auth_snapshot()?;
     if activation_snapshot != prepared.auth_snapshot
         && activation_snapshot != auth_snapshot_for_account(&fresh)?
@@ -51,7 +67,7 @@ where
     }
 
     let account_id = account_id.to_string();
-    commit_activation(&activation_snapshot, move |store| {
+    commit_activation_cancellable(&activation_snapshot, cancelled, move |store| {
         let account = store
             .accounts
             .iter_mut()
@@ -83,12 +99,13 @@ where
     if account.name.trim().is_empty() {
         account.name = next_auto_account_name(&AccountsStore::default(), AUTO_ACCOUNT_NAME_PREFIX);
     }
-    add_pending_account(account, false, client).await
+    add_pending_account(account, false, client, None).await
 }
 
 pub(crate) async fn add_oauth_account_with_client<C>(
     mut account: StoredAccount,
     client: &C,
+    cancelled: &AtomicBool,
 ) -> Result<StoredAccount>
 where
     C: ChatGptTokenRefreshClient + ?Sized,
@@ -96,17 +113,19 @@ where
     if account.name.trim().is_empty() {
         account.name = next_auto_account_name(&load_accounts()?, AUTO_ACCOUNT_NAME_PREFIX);
     }
-    add_pending_account(account, true, client).await
+    add_pending_account(account, true, client, Some(cancelled)).await
 }
 
 async fn add_pending_account<C>(
     account: StoredAccount,
     force_activate: bool,
     client: &C,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<StoredAccount>
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    ensure_not_cancelled(cancelled)?;
     let auto_named = account.name.starts_with(AUTO_ACCOUNT_NAME_PREFIX)
         && account.name[AUTO_ACCOUNT_NAME_PREFIX.len()..]
             .trim()
@@ -116,14 +135,19 @@ where
         persist_catalog_account(account, auto_named.then_some(AUTO_ACCOUNT_NAME_PREFIX))?;
 
     if force_activate || was_empty {
-        activate_existing_account_with_client(&stored.id, client)
-            .await
-            .with_context(|| {
+        let activation =
+            activate_existing_account_with_client_inner(&stored.id, client, cancelled).await;
+        if let Err(error) = activation {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                let _ = remove_catalog_account_if_inactive(&stored.id);
+            }
+            return Err(error).with_context(|| {
                 format!(
                     "Account '{}' was saved, but it could not be activated",
                     stored.name
                 )
-            })?;
+            });
+        }
     }
 
     Ok(get_account(&stored.id)?.unwrap_or(stored))
@@ -249,10 +273,126 @@ enum CatalogMergeOutcome {
     NeedsActivation(AccountsStore),
 }
 
-pub(crate) fn persist_imported_account_catalog_only(
-    account: StoredAccount,
-) -> Result<StoredAccount> {
-    persist_catalog_account(account, None).map(|(stored, _)| stored)
+pub(crate) enum CatalogRestoreOutcome {
+    Added(StoredAccount),
+    UpdatedExisting(StoredAccount),
+}
+
+pub(crate) struct RestoredCatalogAccount {
+    pub(crate) account: StoredAccount,
+    pub(crate) source_refresh_token: Option<String>,
+}
+
+pub(crate) fn persist_restored_accounts_catalog_only(
+    restored_accounts: Vec<RestoredCatalogAccount>,
+) -> Result<Vec<CatalogRestoreOutcome>> {
+    for restored in &restored_accounts {
+        validate_stored_account_credentials(&restored.account)?;
+    }
+    if restored_accounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let _lock = acquire_store_lock()?;
+    let path = get_accounts_file()?;
+    let mut store = load_accounts_from_path(&path)?;
+    let mut outcomes = Vec::with_capacity(restored_accounts.len());
+
+    for restored in restored_accounts {
+        outcomes.push(apply_restored_account(&mut store, restored)?);
+    }
+
+    crate::auth::validate_catalog_credential_uniqueness(&store)?;
+    write_accounts_store_atomic(&path, &store)?;
+    Ok(outcomes)
+}
+
+fn apply_restored_account(
+    store: &mut AccountsStore,
+    restored: RestoredCatalogAccount,
+) -> Result<CatalogRestoreOutcome> {
+    let RestoredCatalogAccount {
+        account,
+        source_refresh_token,
+    } = restored;
+    let mut matched_index = None;
+    for (index, existing) in store.accounts.iter().enumerate() {
+        let source_matches = source_refresh_token.as_deref().is_some_and(|source| {
+            matches!(
+                &existing.auth_data,
+                crate::types::AuthData::ChatGPT { refresh_token, .. } if refresh_token == source
+            )
+        });
+        if source_matches || stored_accounts_share_credentials(existing, &account)? {
+            matched_index = Some(index);
+            break;
+        }
+    }
+
+    if let Some(index) = matched_index {
+        let existing = &store.accounts[index];
+        match (&existing.auth_data, &account.auth_data) {
+            (
+                crate::types::AuthData::ChatGPT {
+                    id_token: existing_id_token,
+                    account_id: existing_account_id,
+                    ..
+                },
+                crate::types::AuthData::ChatGPT {
+                    id_token: incoming_id_token,
+                    account_id: incoming_account_id,
+                    ..
+                },
+            ) => {
+                let existing_identity =
+                    resolved_chatgpt_account_id(existing_account_id.as_deref(), existing_id_token)?;
+                let incoming_identity =
+                    resolved_chatgpt_account_id(incoming_account_id.as_deref(), incoming_id_token)?;
+                if existing_identity.is_some()
+                    && incoming_identity.is_some()
+                    && existing_identity != incoming_identity
+                {
+                    anyhow::bail!(
+                        "Restored credentials belong to a different ChatGPT account than the matching refresh token"
+                    );
+                }
+
+                let existing = &mut store.accounts[index];
+                record_chatgpt_credential_predecessor(existing)?;
+                existing.auth_data = account.auth_data.clone();
+                if account.email.is_some() {
+                    existing.email = account.email.clone();
+                }
+                if account.plan_type.is_some() {
+                    existing.plan_type = account.plan_type.clone();
+                }
+            }
+            (crate::types::AuthData::ApiKey { .. }, crate::types::AuthData::ApiKey { .. }) => {}
+            _ => anyhow::bail!("Restored credentials conflict with an existing account"),
+        }
+
+        return Ok(CatalogRestoreOutcome::UpdatedExisting(
+            store.accounts[index].clone(),
+        ));
+    }
+
+    if store
+        .accounts
+        .iter()
+        .any(|existing| existing.id == account.id)
+    {
+        anyhow::bail!("An account with this ID already exists");
+    }
+    if store
+        .accounts
+        .iter()
+        .any(|existing| existing.name == account.name)
+    {
+        anyhow::bail!("An account with name '{}' already exists", account.name);
+    }
+
+    store.accounts.push(account.clone());
+    Ok(CatalogRestoreOutcome::Added(account))
 }
 
 fn persist_catalog_account(
@@ -446,7 +586,25 @@ fn prepare_catalog(require_process_guard: bool) -> Result<PreparedCatalog> {
     })
 }
 
+fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        anyhow::bail!("OAuth login cancelled");
+    }
+    Ok(())
+}
+
 fn commit_activation<T, F>(expected_auth: &AuthSnapshot, mutator: F) -> Result<T>
+where
+    F: FnOnce(&mut AccountsStore) -> Result<(AuthSnapshot, T)>,
+{
+    commit_activation_cancellable(expected_auth, None, mutator)
+}
+
+fn commit_activation_cancellable<T, F>(
+    expected_auth: &AuthSnapshot,
+    cancelled: Option<&AtomicBool>,
+    mutator: F,
+) -> Result<T>
 where
     F: FnOnce(&mut AccountsStore) -> Result<(AuthSnapshot, T)>,
 {
@@ -478,6 +636,7 @@ where
 
     test_replace_auth("CODEX_SWITCHER_TEST_AUTH_REPLACEMENT_BEFORE_PUBLISH")?;
     ensure_switch_allowed()?;
+    ensure_not_cancelled(cancelled)?;
 
     if let Some(staged_auth) = staged_auth {
         staged_auth.commit()?;
@@ -788,6 +947,92 @@ mod tests {
     }
 
     #[test]
+    fn restored_rotated_credentials_update_the_existing_source_account() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let existing = add_account(expired_chatgpt_account()).expect("add existing account");
+        let incoming = StoredAccount::new_chatgpt(
+            "Imported duplicate".to_string(),
+            Some("rotating@example.com".to_string()),
+            Some("pro".to_string()),
+            test_jwt(chrono::Utc::now().timestamp() + 3600),
+            test_jwt(chrono::Utc::now().timestamp() + 3600),
+            "refresh-rotated".to_string(),
+            Some("acct-rotating".to_string()),
+        );
+
+        let outcomes = persist_restored_accounts_catalog_only(vec![RestoredCatalogAccount {
+            account: incoming,
+            source_refresh_token: Some("refresh-original".to_string()),
+        }])
+        .expect("preserve rotated credentials");
+
+        assert!(matches!(
+            outcomes.as_slice(),
+            [CatalogRestoreOutcome::UpdatedExisting(account)] if account.id == existing.id
+        ));
+        let store = load_accounts().expect("load store");
+        assert!(store.accounts.len() == 1);
+        assert!(matches!(
+            &store.accounts[0].auth_data,
+            crate::types::AuthData::ChatGPT { refresh_token, .. }
+                if refresh_token == "refresh-rotated"
+        ));
+        assert!(!store.accounts[0]
+            .previous_chatgpt_credential_hashes
+            .is_empty());
+    }
+
+    #[test]
+    fn multiple_restored_rotations_keep_every_stale_live_generation_repairable() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let original = add_account(expired_chatgpt_account()).expect("add original account");
+        write_auth_for_test(&original).expect("write original live auth");
+        let generation = |refresh_token: &str| {
+            StoredAccount::new_chatgpt(
+                "Imported duplicate".to_string(),
+                Some("rotating@example.com".to_string()),
+                Some("pro".to_string()),
+                test_jwt(chrono::Utc::now().timestamp() + 3600),
+                test_jwt(chrono::Utc::now().timestamp() + 3600),
+                refresh_token.to_string(),
+                Some("acct-rotating".to_string()),
+            )
+        };
+
+        persist_restored_accounts_catalog_only(vec![
+            RestoredCatalogAccount {
+                account: generation("refresh-generation-one"),
+                source_refresh_token: Some("refresh-original".to_string()),
+            },
+            RestoredCatalogAccount {
+                account: generation("refresh-generation-two"),
+                source_refresh_token: Some("refresh-generation-one".to_string()),
+            },
+        ])
+        .expect("persist both rotations");
+        crate::auth::storage::reconcile_current_auth_catalog()
+            .expect("repair live auth from the newest catalog generation");
+
+        let stored = load_accounts().expect("load catalog");
+        assert!(stored.accounts[0].previous_chatgpt_credential_hashes.len() == 2);
+        assert!(matches!(
+            &stored.accounts[0].auth_data,
+            crate::types::AuthData::ChatGPT { refresh_token, .. }
+                if refresh_token == "refresh-generation-two"
+        ));
+        let live = crate::auth::read_current_auth()
+            .expect("read live auth")
+            .expect("live auth exists");
+        assert!(matches!(
+            live.tokens,
+            Some(crate::types::TokenData { refresh_token, .. })
+                if refresh_token == "refresh-generation-two"
+        ));
+    }
+
+    #[test]
     fn catalog_only_delete_refuses_the_active_account() {
         let _guard = crate::test_support::env_lock();
         let _env = TestEnv::new();
@@ -941,8 +1186,13 @@ mod tests {
         let _env = TestEnv::new();
         std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "1");
 
-        let result =
-            add_oauth_account_with_client(api_account("OAuth", "sk-oauth"), &NoRefreshClient).await;
+        let cancelled = AtomicBool::new(false);
+        let result = add_oauth_account_with_client(
+            api_account("OAuth", "sk-oauth"),
+            &NoRefreshClient,
+            &cancelled,
+        )
+        .await;
 
         assert!(result.is_err());
         let store = load_accounts().expect("load store");
@@ -994,7 +1244,10 @@ mod tests {
             .await
             .expect("delete background account");
 
-        assert_eq!(live_auth_bytes(), auth_before);
+        assert!(
+            live_auth_bytes() == auth_before,
+            "live auth bytes changed unexpectedly"
+        );
         let store = load_accounts().expect("load store");
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.active_account_id.as_deref(), Some(active.id.as_str()));
@@ -1024,7 +1277,10 @@ mod tests {
             .accounts
             .iter()
             .any(|account| account.id == background.id));
-        assert_eq!(String::from_utf8(live_auth_bytes()).unwrap(), replacement);
+        assert!(
+            String::from_utf8(live_auth_bytes()).expect("live auth is UTF-8") == replacement,
+            "third-party live auth was overwritten"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1049,14 +1305,14 @@ mod tests {
             Some(fallback.id.as_str())
         );
         assert!(store.accounts[0].last_used_at.is_some());
-        assert_eq!(
+        assert!(matches!(
             read_current_auth()
                 .expect("read auth")
                 .expect("auth exists")
                 .openai_api_key
                 .as_deref(),
             Some("sk-fallback")
-        );
+        ));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1073,7 +1329,10 @@ mod tests {
         let result = activate_existing_account_with_client(&second.id, &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(live_auth_bytes(), auth_before);
+        assert!(
+            live_auth_bytes() == auth_before,
+            "live auth bytes changed unexpectedly"
+        );
         assert_eq!(
             load_accounts()
                 .expect("load store")
@@ -1097,7 +1356,10 @@ mod tests {
         let result = activate_existing_account_with_client(&second.id, &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(live_auth_bytes(), auth_before);
+        assert!(
+            live_auth_bytes() == auth_before,
+            "live auth bytes changed unexpectedly"
+        );
         assert_eq!(
             load_accounts()
                 .expect("load store")
@@ -1123,7 +1385,10 @@ mod tests {
         let result = add_imported_account_with_client(imported.clone(), &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(String::from_utf8(live_auth_bytes()).unwrap(), replacement);
+        assert!(
+            String::from_utf8(live_auth_bytes()).expect("live auth is UTF-8") == replacement,
+            "third-party live auth was overwritten"
+        );
         let store = load_accounts().expect("load store");
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.accounts[0].id, imported.id);
@@ -1147,7 +1412,10 @@ mod tests {
         let result = activate_existing_account_with_client(&second.id, &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(String::from_utf8(live_auth_bytes()).unwrap(), replacement);
+        assert!(
+            String::from_utf8(live_auth_bytes()).expect("live auth is UTF-8") == replacement,
+            "third-party live auth was overwritten"
+        );
         assert_eq!(
             load_accounts()
                 .expect("load store")
@@ -1171,7 +1439,10 @@ mod tests {
         let result = activate_existing_account_with_client(&second.id, &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(String::from_utf8(live_auth_bytes()).unwrap(), replacement);
+        assert!(
+            String::from_utf8(live_auth_bytes()).expect("live auth is UTF-8") == replacement,
+            "third-party live auth was overwritten"
+        );
         assert_eq!(
             load_accounts()
                 .expect("load store")
@@ -1198,7 +1469,10 @@ mod tests {
         let result = activate_existing_account_with_client(&second.id, &NoRefreshClient).await;
 
         assert!(result.is_err());
-        assert_eq!(String::from_utf8(live_auth_bytes()).unwrap(), replacement);
+        assert!(
+            String::from_utf8(live_auth_bytes()).expect("live auth is UTF-8") == replacement,
+            "third-party live auth was overwritten"
+        );
         assert_eq!(
             load_accounts()
                 .expect("load store")
@@ -1235,13 +1509,13 @@ mod tests {
                 .as_deref(),
             Some(first.id.as_str())
         );
-        assert_eq!(
+        assert!(matches!(
             read_current_auth()
                 .expect("read auth")
                 .expect("auth exists")
                 .openai_api_key
                 .as_deref(),
             Some("sk-second")
-        );
+        ));
     }
 }

@@ -78,4 +78,10 @@ describe("AccountCard", () => {
 
     expect(screen.getByRole("button", { name: "Codex running" })).toBeDisabled();
   });
+
+  it("locks switching while another account switch is in progress", () => {
+    renderCard({ switchInProgress: true });
+
+    expect(screen.getByRole("button", { name: "Switch" })).toBeDisabled();
+  });
 });

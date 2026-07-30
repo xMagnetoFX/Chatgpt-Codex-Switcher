@@ -120,6 +120,7 @@ function App() {
     }
   });
   const accountsCountRef = useRef(0);
+  const switchInFlightRef = useRef(false);
   const isWarmupRunningRef = useRef(false);
   const autoWarmupTriggeredRef = useRef(false);
 
@@ -304,21 +305,23 @@ function App() {
   }, []);
 
   const handleSwitch = async (accountId: string) => {
-    const latestProcessInfo = await checkProcesses();
-    if (latestProcessInfo && !latestProcessInfo.can_switch && !restartSwitchEnabled) {
-      showWarmupToast(
-        "Codex is running. Close it first, or enable restart & switch in Settings.",
-        true
-      );
-      return;
-    }
-
-    const shouldRestartCodex = latestProcessInfo
-      ? !latestProcessInfo.can_switch && restartSwitchEnabled
-      : false;
+    if (switchInFlightRef.current) return;
+    switchInFlightRef.current = true;
+    setSwitchingId(accountId);
 
     try {
-      setSwitchingId(accountId);
+      const latestProcessInfo = await checkProcesses();
+      if (latestProcessInfo && !latestProcessInfo.can_switch && !restartSwitchEnabled) {
+        showWarmupToast(
+          "Codex is running. Close it first, or enable restart & switch in Settings.",
+          true
+        );
+        return;
+      }
+
+      const shouldRestartCodex = latestProcessInfo
+        ? !latestProcessInfo.can_switch && restartSwitchEnabled
+        : false;
       if (shouldRestartCodex) {
         await restartCodexAndSwitchAccount(accountId);
       } else {
@@ -329,6 +332,7 @@ function App() {
       console.error("Failed to switch account:", err);
       showWarmupToast(`Switch failed: ${formatWarmupError(err)}`, true);
     } finally {
+      switchInFlightRef.current = false;
       setSwitchingId(null);
     }
   };
@@ -501,7 +505,6 @@ function App() {
       setIsImportingSlim(true);
       setConfigModalError(null);
       const summary = await importAccountsSlimText(configPayload);
-      setMaskedAccounts(new Set());
       setIsConfigModalOpen(false);
       showWarmupToast(
         `Imported ${summary.imported_count}, skipped ${summary.skipped_count} (total ${summary.total_in_payload})`

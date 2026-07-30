@@ -166,11 +166,8 @@ pub struct OAuthLoginResult {
 /// Start the OAuth login flow
 pub async fn start_oauth_login(
     account_name: String,
-) -> Result<(
-    OAuthLoginInfo,
-    oneshot::Receiver<Result<OAuthLoginResult>>,
-    Arc<AtomicBool>,
-)> {
+    cancelled: Arc<AtomicBool>,
+) -> Result<(OAuthLoginInfo, oneshot::Receiver<Result<OAuthLoginResult>>)> {
     let pkce = generate_pkce();
     let state = generate_state();
 
@@ -211,7 +208,6 @@ pub async fn start_oauth_login(
 
     // Create a channel for the result
     let (tx, rx) = oneshot::channel();
-    let cancelled = Arc::new(AtomicBool::new(false));
 
     // Spawn the server in a background thread
     let server = Arc::new(server);
@@ -232,7 +228,7 @@ pub async fn start_oauth_login(
         let _ = tx.send(result);
     });
 
-    Ok((login_info, rx, cancelled))
+    Ok((login_info, rx))
 }
 
 /// Run the OAuth callback server
@@ -269,6 +265,7 @@ async fn run_oauth_server(
             &expected_state,
             &redirect_uri,
             &account_name,
+            &cancelled,
         )
         .await;
 
@@ -298,6 +295,7 @@ async fn handle_oauth_request(
     expected_state: &str,
     redirect_uri: &str,
     account_name: &str,
+    cancelled: &AtomicBool,
 ) -> HandleResult {
     let url_str = request.url().to_string();
     let parsed = match url::Url::parse(&format!("http://localhost{url_str}")) {
@@ -362,6 +360,13 @@ async fn handle_oauth_request(
         // Exchange code for tokens
         match exchange_code_for_tokens(DEFAULT_ISSUER, CLIENT_ID, redirect_uri, pkce, &code).await {
             Ok(tokens) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    let _ = request.respond(
+                        Response::from_string("OAuth login cancelled").with_status_code(409),
+                    );
+                    return HandleResult::Error(anyhow::anyhow!("OAuth login cancelled"));
+                }
+
                 println!("[OAuth] Token exchange successful!");
                 // Parse claims from ID token
                 let (email, plan_type, chatgpt_account_id) =

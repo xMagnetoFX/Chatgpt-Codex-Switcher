@@ -289,6 +289,29 @@ describe("App", () => {
     expect(switchAccount).not.toHaveBeenCalled();
   });
 
+  it("dispatches only one account switch at a time", async () => {
+    const switchAccount = vi.fn().mockResolvedValue(undefined);
+    useAccountsMock.mockReturnValue(
+      buildUseAccountsReturn({
+        accounts: [
+          makeAccount("active", "Active Pilot", "active@example.com", true),
+          makeAccount("standby-a", "Standby A", "a@example.com"),
+          makeAccount("standby-b", "Standby B", "b@example.com"),
+        ],
+        switchAccount,
+      })
+    );
+
+    await renderApp();
+
+    const switchButtons = await screen.findAllByRole("button", { name: "Switch" });
+    fireEvent.click(switchButtons[0]);
+    fireEvent.click(switchButtons[1]);
+    await flushAsyncWork();
+
+    expect(switchAccount).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps switching locked when restart switching is disabled", async () => {
     window.localStorage.setItem("codex-switcher-restart-switch", "false");
     const switchAccount = vi.fn().mockResolvedValue(undefined);

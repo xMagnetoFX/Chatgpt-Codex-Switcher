@@ -1,6 +1,7 @@
 use super::*;
 use crate::auth::switcher::{get_codex_auth_file, read_current_auth, write_auth_for_test};
 use crate::types::{AuthDotJson, TokenData};
+use base64::Engine as _;
 
 struct TestEnv {
     _config_dir: tempfile::TempDir,
@@ -45,15 +46,33 @@ fn api_account(name: &str, key: &str) -> StoredAccount {
     StoredAccount::new_api_key(name.to_string(), key.to_string())
 }
 
+fn jwt_with_expiry(expiry: i64) -> String {
+    let payload = serde_json::json!({ "exp": expiry });
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).expect("serialize expiry"));
+    format!("header.{encoded}.signature")
+}
+
+fn id_token(account_id: Option<&str>) -> String {
+    let auth = account_id
+        .map(|id| serde_json::json!({ "chatgpt_account_id": id }))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let payload = serde_json::json!({ "https://api.openai.com/auth": auth });
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).expect("serialize claims"));
+    format!("header.{encoded}.signature")
+}
+
 fn chatgpt_account(name: &str, suffix: &str) -> StoredAccount {
+    let account_id = format!("acct-{suffix}");
     StoredAccount::new_chatgpt(
         name.to_string(),
         Some(format!("{name}@example.com")),
         Some("plus".to_string()),
-        format!("id-{suffix}"),
-        format!("access-{suffix}"),
+        id_token(Some(&account_id)),
+        jwt_with_expiry(Utc::now().timestamp() + 3600),
         format!("refresh-{suffix}"),
-        Some(format!("acct-{suffix}")),
+        Some(account_id),
     )
 }
 
@@ -85,17 +104,17 @@ fn auth_json_for_account(account: &StoredAccount) -> AuthDotJson {
 
 fn set_chatgpt_generation(account: &mut StoredAccount, suffix: &str, refreshed_at: DateTime<Utc>) {
     let AuthData::ChatGPT {
-        id_token,
+        id_token: stored_id_token,
         access_token,
         refresh_token,
+        account_id,
         last_refresh,
-        ..
     } = &mut account.auth_data
     else {
         panic!("expected ChatGPT account");
     };
-    *id_token = format!("id-{suffix}");
-    *access_token = format!("access-{suffix}");
+    *stored_id_token = id_token(account_id.as_deref());
+    *access_token = jwt_with_expiry(Utc::now().timestamp() + 3600);
     *refresh_token = format!("refresh-{suffix}");
     *last_refresh = Some(refreshed_at);
 }
@@ -161,6 +180,35 @@ fn catalog_rejects_duplicate_credential_identities() {
     assert!(duplicate_identity.is_err());
 
     assert_eq!(load_accounts().expect("load store").accounts.len(), 2);
+}
+
+#[test]
+fn catalog_rejects_duplicate_refresh_tokens_without_stable_identity() {
+    let _guard = crate::test_support::env_lock();
+    let _env = TestEnv::new();
+
+    let mut first = chatgpt_account("First", "first");
+    let mut second = chatgpt_account("Second", "second");
+    for account in [&mut first, &mut second] {
+        let AuthData::ChatGPT {
+            id_token,
+            refresh_token,
+            account_id,
+            ..
+        } = &mut account.auth_data
+        else {
+            unreachable!();
+        };
+        *id_token = "identity-less-id-token".to_string();
+        *refresh_token = "shared-refresh-token".to_string();
+        *account_id = None;
+    }
+
+    add_account(first).expect("add first account");
+    let duplicate = add_account(second);
+
+    assert!(duplicate.is_err());
+    assert_eq!(load_accounts().expect("load store").accounts.len(), 1);
 }
 
 #[test]
@@ -231,7 +279,10 @@ fn background_token_update_preserves_live_auth_bytes() {
     )
     .expect("update catalog tokens");
 
-    assert_eq!(fs::read(auth_path).expect("read auth after"), before);
+    assert!(
+        fs::read(auth_path).expect("read auth after") == before,
+        "background update must preserve live auth bytes"
+    );
 }
 
 #[test]
@@ -241,13 +292,18 @@ fn reconciliation_repairs_stale_live_credentials_from_the_catalog() {
     let refreshed_at = Utc::now();
     let mut current = chatgpt_account("ChatGPT", "current");
     set_chatgpt_generation(&mut current, "current", refreshed_at);
-    let current = add_account(current).expect("add current account");
     let mut stale = current.clone();
     set_chatgpt_generation(
         &mut stale,
         "stale",
         refreshed_at - chrono::Duration::minutes(1),
     );
+    current.previous_chatgpt_credential_hashes.push(
+        chatgpt_credential_fingerprint(&stale)
+            .expect("fingerprint stale credentials")
+            .encoded(),
+    );
+    add_account(current).expect("add current account");
     write_auth_for_test(&stale).expect("write stale live credentials");
 
     let outcome = reconcile_current_auth_catalog().expect("repair stale live credentials");
@@ -258,11 +314,45 @@ fn reconciliation_repairs_stale_live_credentials_from_the_catalog() {
         .expect("live credentials exist");
     assert!(matches!(
         live.tokens,
-        Some(TokenData {
-            access_token,
-            refresh_token,
-            ..
-        }) if access_token == "access-current" && refresh_token == "refresh-current"
+        Some(TokenData { refresh_token, .. }) if refresh_token == "refresh-current"
+    ));
+}
+
+#[test]
+fn refresh_commit_propagates_live_reconciliation_conflicts() {
+    let _guard = crate::test_support::env_lock();
+    let _env = TestEnv::new();
+
+    let stored = add_account(chatgpt_account("ChatGPT", "stored")).expect("add account");
+    let expected = chatgpt_credential_fingerprint(&stored).expect("fingerprint credentials");
+    let mut ambiguous_live = stored.clone();
+    set_chatgpt_generation(&mut ambiguous_live, "ambiguous", Utc::now());
+    if let AuthData::ChatGPT { last_refresh, .. } = &mut ambiguous_live.auth_data {
+        *last_refresh = None;
+    }
+    write_auth_for_test(&ambiguous_live).expect("write ambiguous live credentials");
+
+    let result = update_account_chatgpt_tokens_after_refresh(
+        &stored.id,
+        &expected,
+        ChatGptTokenUpdate {
+            id_token: id_token(Some("acct-stored")),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 7200),
+            refresh_token: "refresh-provider".to_string(),
+            account_id: Some("acct-stored".to_string()),
+            email: None,
+            plan_type: None,
+            last_refresh: Some(Utc::now()),
+        },
+    );
+
+    assert!(result.is_err());
+    let current = get_account(&stored.id)
+        .expect("load account")
+        .expect("account exists");
+    assert!(matches!(
+        current.auth_data,
+        AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-stored"
     ));
 }
 
@@ -358,18 +448,16 @@ fn newest_live_generation_wins_during_refresh_reconciliation() {
 
     assert!(matches!(
         winner.auth_data,
-        AuthData::ChatGPT {
-            access_token,
-            refresh_token,
-            ..
-        } if access_token == "access-newest-live" && refresh_token == "refresh-newest-live"
+        AuthData::ChatGPT { refresh_token, .. }
+            if refresh_token == "refresh-newest-live"
     ));
     let stored = get_account(&initial.id)
         .expect("load account")
         .expect("account exists");
     assert!(matches!(
         stored.auth_data,
-        AuthData::ChatGPT { access_token, .. } if access_token == "access-newest-live"
+        AuthData::ChatGPT { refresh_token, .. }
+            if refresh_token == "refresh-newest-live"
     ));
 }
 

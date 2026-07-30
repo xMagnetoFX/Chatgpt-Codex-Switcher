@@ -1,9 +1,12 @@
 //! ChatGPT OAuth token refresh helpers
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+
 use anyhow::{Context, Result};
-use base64::Engine;
 use chrono::Utc;
 use futures::future::BoxFuture;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::{sleep, Duration};
 
 use super::storage::{
@@ -14,6 +17,27 @@ use crate::types::{AuthData, StoredAccount};
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const EXPIRY_SKEW_SECONDS: i64 = 60;
+
+type AccountRefreshMutex = AsyncMutex<()>;
+static ACCOUNT_REFRESH_LOCKS: LazyLock<StdMutex<HashMap<String, Weak<AccountRefreshMutex>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+async fn acquire_account_refresh_lock(account_id: &str) -> OwnedMutexGuard<()> {
+    let refresh_lock = {
+        let mut locks = ACCOUNT_REFRESH_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(account_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(AccountRefreshMutex::new(()));
+            locks.insert(account_id.to_string(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    refresh_lock.lock_owned().await
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct RefreshTokenResponse {
@@ -55,6 +79,7 @@ pub(crate) async fn ensure_chatgpt_tokens_fresh_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    let _refresh_guard = acquire_account_refresh_lock(&account.id).await;
     let account = latest_catalog_account(account)?;
     ensure_catalog_account_fresh_with_client(account, client).await
 }
@@ -66,6 +91,7 @@ pub(crate) async fn ensure_chatgpt_tokens_fresh_for_activation_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    let _refresh_guard = acquire_account_refresh_lock(&account.id).await;
     // Activation already captured and reconciled its expected live-auth snapshot.
     // Reconcile again only inside the refresh CAS commit, otherwise a later
     // process-guard failure could persist the target as active before activation.
@@ -121,6 +147,7 @@ pub(crate) async fn refresh_chatgpt_tokens_with_client<C>(
 where
     C: ChatGptTokenRefreshClient + ?Sized,
 {
+    let _refresh_guard = acquire_account_refresh_lock(&account.id).await;
     let account = latest_catalog_account(account)?;
     let expected_credentials = chatgpt_credential_fingerprint(&account)?;
     let refreshed = refresh_detached_chatgpt_tokens_with_client(&account, client).await?;
@@ -195,7 +222,7 @@ where
     if next_id_token.trim().is_empty() {
         anyhow::bail!("Token refresh did not provide an ID token");
     }
-    if !jwt_payload_is_json(&next_id_token) {
+    if !super::switcher::jwt_payload_is_json(&next_id_token) {
         anyhow::bail!("Token refresh returned a malformed ID token");
     }
     if token_expired_or_near_expiry(&refreshed.access_token) {
@@ -252,7 +279,7 @@ fn account_needs_refresh(account: &StoredAccount) -> Result<bool> {
                 anyhow::bail!("Missing refresh token for account {}", account.name);
             }
             Ok(id_token.trim().is_empty()
-                || !jwt_payload_is_json(id_token)
+                || !super::switcher::jwt_payload_is_json(id_token)
                 || access_token.trim().is_empty()
                 || token_expired_or_near_expiry(access_token))
         }
@@ -315,35 +342,10 @@ pub async fn create_chatgpt_account_from_refresh_token(
 }
 
 fn token_expired_or_near_expiry(access_token: &str) -> bool {
-    match parse_jwt_exp(access_token) {
+    match super::switcher::jwt_expiration(access_token) {
         Some(expiry) => expiry <= Utc::now().timestamp() + EXPIRY_SKEW_SECONDS,
         None => true,
     }
-}
-
-fn jwt_payload_is_json(token: &str) -> bool {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return false;
-    }
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .ok()
-        .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
-        .is_some()
-}
-
-fn parse_jwt_exp(token: &str) -> Option<i64> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    json.get("exp").and_then(|v| v.as_i64())
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
@@ -402,6 +404,7 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::auth::switcher::{get_codex_auth_file, read_current_auth, write_auth_for_test};
@@ -448,6 +451,32 @@ mod tests {
                     FakeOutcome::Success(response) => Ok(response.clone()),
                     FakeOutcome::Failure(message) => anyhow::bail!(*message),
                 }
+            })
+        }
+    }
+
+    struct BlockingRefreshClient {
+        calls: AtomicUsize,
+        first_call_started: tokio::sync::Notify,
+        second_call_started: tokio::sync::Notify,
+        release_first_call: tokio::sync::Notify,
+        response: RefreshTokenResponse,
+    }
+
+    impl ChatGptTokenRefreshClient for BlockingRefreshClient {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> BoxFuture<'a, Result<RefreshTokenResponse>> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.first_call_started.notify_one();
+                    self.release_first_call.notified().await;
+                } else if call == 1 {
+                    self.second_call_started.notify_one();
+                }
+                Ok(self.response.clone())
             })
         }
     }
@@ -614,24 +643,81 @@ mod tests {
             .expect("load account")
             .expect("account should exist");
         assert!(matches!(
-            stored.auth_data,
+            &stored.auth_data,
             AuthData::ChatGPT {
                 refresh_token,
                 last_refresh: Some(_),
                 ..
             } if refresh_token == "refresh-new"
         ));
-        assert_ne!(
-            std::fs::read(&auth_path).expect("read live auth after refresh"),
-            auth_before
+        assert!(
+            std::fs::read(&auth_path).expect("read live auth after refresh") != auth_before,
+            "live auth should change after refresh"
         );
         let live = read_current_auth()
             .expect("read live auth")
             .expect("live auth should exist");
-        assert_eq!(
-            live.tokens.expect("live ChatGPT tokens").refresh_token,
-            "refresh-new"
-        );
+        assert!(matches!(
+            live.tokens,
+            Some(crate::types::TokenData { refresh_token, .. }) if refresh_token == "refresh-new"
+        ));
+        assert!(stored.previous_chatgpt_credential_hashes.len() == 1);
+
+        crate::auth::storage::reconcile_current_auth_catalog()
+            .expect("clear obsolete predecessor history");
+        let reconciled = get_account(&account.id)
+            .expect("load reconciled account")
+            .expect("reconciled account should exist");
+        assert!(reconciled.previous_chatgpt_credential_hashes.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn concurrent_refreshes_for_one_account_are_serialized() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let account = add_account(account_with_access_token(jwt_with_expiry(
+            Utc::now().timestamp() - 60,
+        )))
+        .expect("add account");
+        let client = Arc::new(BlockingRefreshClient {
+            calls: AtomicUsize::new(0),
+            first_call_started: tokio::sync::Notify::new(),
+            second_call_started: tokio::sync::Notify::new(),
+            release_first_call: tokio::sync::Notify::new(),
+            response: RefreshTokenResponse {
+                id_token: Some(id_token("user@example.com", "acct-one")),
+                access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+                refresh_token: Some("refresh-serialized".to_string()),
+            },
+        });
+
+        let first_account = account.clone();
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move {
+            ensure_chatgpt_tokens_fresh_with_client(&first_account, first_client.as_ref()).await
+        });
+        client.first_call_started.notified().await;
+
+        let second_account = account.clone();
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move {
+            ensure_chatgpt_tokens_fresh_with_client(&second_account, second_client.as_ref()).await
+        });
+        let second_reached_provider = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.second_call_started.notified(),
+        )
+        .await
+        .is_ok();
+        client.release_first_call.notify_one();
+
+        let first_result = first.await.expect("join first refresh");
+        let second_result = second.await.expect("join second refresh");
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        assert!(!second_reached_provider);
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -725,11 +811,51 @@ mod tests {
         let live = read_current_auth()
             .expect("read live auth")
             .expect("live auth should exist");
-        assert_eq!(
-            live.tokens.expect("live ChatGPT tokens").refresh_token,
-            "refresh-new"
-        );
+        assert!(matches!(
+            live.tokens,
+            Some(crate::types::TokenData { refresh_token, .. }) if refresh_token == "refresh-new"
+        ));
         assert!(live.last_refresh.is_some());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn failed_legacy_live_publication_is_repaired_from_the_catalog() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let mut legacy = account_with_access_token(jwt_with_expiry(Utc::now().timestamp() - 60));
+        if let AuthData::ChatGPT {
+            account_id,
+            last_refresh,
+            ..
+        } = &mut legacy.auth_data
+        {
+            *account_id = None;
+            *last_refresh = None;
+        }
+        let legacy = add_account(legacy).expect("add legacy account");
+        write_auth_for_test(&legacy).expect("write legacy live auth");
+        let client = FakeRefreshClient::success(RefreshTokenResponse {
+            id_token: Some(id_token("user@example.com", "acct-one")),
+            access_token: jwt_with_expiry(Utc::now().timestamp() + 3600),
+            refresh_token: Some("refresh-repaired".to_string()),
+        });
+        std::env::set_var("CODEX_SWITCHER_TEST_ATOMIC_FAIL", "publish_auth");
+
+        let refresh_result = ensure_chatgpt_tokens_fresh_with_client(&legacy, &client).await;
+
+        std::env::remove_var("CODEX_SWITCHER_TEST_ATOMIC_FAIL");
+        assert!(refresh_result.is_err());
+        crate::auth::storage::reconcile_current_auth_catalog()
+            .expect("repair live credentials from catalog");
+        let live = read_current_auth()
+            .expect("read repaired live auth")
+            .expect("repaired live auth exists");
+        assert!(matches!(
+            live.tokens,
+            Some(crate::types::TokenData { refresh_token, .. })
+                if refresh_token == "refresh-repaired"
+        ));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -759,20 +885,21 @@ mod tests {
             .await
             .expect("refresh background account");
 
-        assert_eq!(
-            std::fs::read(auth_path).expect("read live auth after refresh"),
-            auth_before
+        assert!(
+            std::fs::read(auth_path).expect("read live auth after refresh") == auth_before,
+            "background refresh must preserve live auth bytes"
         );
         let stored = get_account(&background.id)
             .expect("load background")
             .expect("background should exist");
         assert!(matches!(
-            stored.auth_data,
+            &stored.auth_data,
             AuthData::ChatGPT {
                 refresh_token,
                 ..
             } if refresh_token == "refresh-new"
         ));
+        assert!(stored.previous_chatgpt_credential_hashes.is_empty());
     }
 
     #[tokio::test]
@@ -784,9 +911,10 @@ mod tests {
             refresh_token: Some("refresh-new".to_string()),
         });
 
-        let error = refresh_detached_chatgpt_tokens_with_client(&account, &client)
-            .await
-            .expect_err("identity drift should fail");
+        let error = match refresh_detached_chatgpt_tokens_with_client(&account, &client).await {
+            Ok(_) => panic!("identity drift should fail"),
+            Err(error) => error,
+        };
 
         assert_eq!(client.call_count(), 1);
         assert!(error.to_string().contains("different ChatGPT account"));
@@ -825,9 +953,9 @@ mod tests {
             stored.auth_data,
             AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-old"
         ));
-        assert_eq!(
-            std::fs::read(auth_path).expect("read live auth after failure"),
-            auth_before
+        assert!(
+            std::fs::read(auth_path).expect("read live auth after failure") == auth_before,
+            "failed refresh must preserve live auth bytes"
         );
     }
 }

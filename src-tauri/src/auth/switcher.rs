@@ -128,6 +128,21 @@ pub(crate) fn reconcile_live_auth(
         catalog_changed = true;
     }
 
+    if state == LiveAuthState::Exact {
+        let account_id = matched_account_id
+            .as_deref()
+            .context("Exact live credentials did not identify an account")?;
+        let existing = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .context("Matched live account disappeared from the catalog")?;
+        if !existing.previous_chatgpt_credential_hashes.is_empty() {
+            existing.previous_chatgpt_credential_hashes.clear();
+            catalog_changed = true;
+        }
+    }
+
     if let Some(account_id) = matched_account_id.as_deref() {
         if store.active_account_id.as_deref() != Some(account_id) {
             store.active_account_id = Some(account_id.to_string());
@@ -168,7 +183,7 @@ pub(crate) fn validate_catalog_credential_uniqueness(store: &AccountsStore) -> R
     Ok(())
 }
 
-fn stored_accounts_share_credentials(
+pub(crate) fn stored_accounts_share_credentials(
     first: &StoredAccount,
     second: &StoredAccount,
 ) -> Result<bool> {
@@ -197,7 +212,9 @@ fn stored_accounts_share_credentials(
                 resolved_chatgpt_account_id(first_account_id.as_deref(), first_id)?;
             let second_identity =
                 resolved_chatgpt_account_id(second_account_id.as_deref(), second_id)?;
-            Ok(exact_bundle || first_identity.is_some() && first_identity == second_identity)
+            Ok(exact_bundle
+                || first_refresh == second_refresh
+                || first_identity.is_some() && first_identity == second_identity)
         }
         _ => Ok(false),
     }
@@ -282,38 +299,43 @@ fn resolve_live_auth(store: &AccountsStore, snapshot: &AuthSnapshot) -> Result<L
     }
 
     let stored_account = identity_matches[0];
-    let stored_last_refresh = match &stored_account.auth_data {
-        AuthData::ChatGPT { last_refresh, .. } => *last_refresh,
-        AuthData::ApiKey { .. } => None,
+    let live_auth_data = AuthData::ChatGPT {
+        id_token: live_tokens.id_token.clone(),
+        access_token: live_tokens.access_token.clone(),
+        refresh_token: live_tokens.refresh_token.clone(),
+        account_id: Some(live_account_id),
+        last_refresh: live_auth.last_refresh,
     };
-    let (Some(live_refresh), Some(stored_refresh)) = (live_auth.last_refresh, stored_last_refresh)
-    else {
-        anyhow::bail!(
-            "Codex auth.json credentials changed without complete refresh timestamps. Sign in again before switching accounts."
-        );
-    };
-
-    if live_refresh == stored_refresh {
-        anyhow::bail!(
-            "Codex auth.json credentials changed with an unchanged refresh timestamp. Sign in again before switching accounts."
-        );
-    }
-
-    if live_refresh < stored_refresh {
+    let live_credential_hash =
+        super::storage::chatgpt_auth_data_fingerprint(&live_auth_data)?.encoded();
+    if stored_account
+        .previous_chatgpt_credential_hashes
+        .contains(&live_credential_hash)
+    {
         return Ok(LiveAuthResolution::Stale {
             account_id: stored_account.id.clone(),
         });
     }
 
+    if live_auth.last_refresh.is_none()
+        || !matches!(
+            &stored_account.auth_data,
+            AuthData::ChatGPT {
+                last_refresh: Some(_),
+                ..
+            }
+        )
+    {
+        anyhow::bail!(
+            "Codex auth.json credentials changed without complete refresh timestamps. Sign in again before switching accounts."
+        );
+    }
+
+    validate_live_chatgpt_tokens_for_catalog_import(live_tokens)?;
     let mut updated_account = stored_account.clone();
     let (email, plan_type) = parse_id_token_claims(&live_tokens.id_token);
-    updated_account.auth_data = AuthData::ChatGPT {
-        id_token: live_tokens.id_token.clone(),
-        access_token: live_tokens.access_token.clone(),
-        refresh_token: live_tokens.refresh_token.clone(),
-        account_id: Some(live_account_id),
-        last_refresh: Some(live_refresh),
-    };
+    updated_account.auth_data = live_auth_data;
+    updated_account.previous_chatgpt_credential_hashes.clear();
     if let Some(email) = email {
         updated_account.email = Some(email);
     }
@@ -406,6 +428,15 @@ fn validate_auth_dot_json(auth: &AuthDotJson) -> Result<()> {
         ),
         (None, None) => anyhow::bail!("Codex auth.json contains no usable credentials"),
     }
+}
+
+fn validate_live_chatgpt_tokens_for_catalog_import(tokens: &TokenData) -> Result<()> {
+    if !jwt_payload_is_json(&tokens.id_token) || jwt_expiration(&tokens.access_token).is_none() {
+        anyhow::bail!(
+            "Codex auth.json contains malformed ChatGPT tokens and cannot replace stored credentials"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_stored_account_credentials(account: &StoredAccount) -> Result<()> {
@@ -551,21 +582,33 @@ pub(crate) fn resolved_chatgpt_account_id(
     }
 }
 
-fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let parts: Vec<&str> = id_token.split('.').collect();
-    if parts.len() != 3 {
-        return (None, None, None);
+pub(crate) fn jwt_payload_is_json(token: &str) -> bool {
+    parse_jwt_payload(token).is_some()
+}
+
+pub(crate) fn jwt_expiration(token: &str) -> Option<i64> {
+    parse_jwt_payload(token)?
+        .get("exp")
+        .and_then(serde_json::Value::as_i64)
+}
+
+fn parse_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
     }
 
     let payload =
-        match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1]) {
-            Ok(bytes) => bytes,
-            Err(_) => return (None, None, None),
-        };
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
 
-    let json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(value) => value,
-        Err(_) => return (None, None, None),
+fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(json) = parse_jwt_payload(id_token) else {
+        return (None, None, None);
     };
 
     let email = json
@@ -621,13 +664,20 @@ mod tests {
         format!("header.{encoded}.signature")
     }
 
+    fn access_token(expiry: i64) -> String {
+        let payload = serde_json::json!({ "exp": expiry });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize expiry"));
+        format!("header.{encoded}.signature")
+    }
+
     fn chatgpt_account(name: &str, account_id: Option<&str>) -> StoredAccount {
         StoredAccount::new_chatgpt_with_last_refresh(
             name.to_string(),
             Some("shared@example.com".to_string()),
             Some("plus".to_string()),
             id_token("shared@example.com", account_id),
-            "access-stored".to_string(),
+            access_token(chrono::Utc::now().timestamp() + 3600),
             "refresh-stored".to_string(),
             account_id.map(String::from),
             Some(
@@ -695,13 +745,13 @@ mod tests {
     }
 
     #[test]
-    fn changed_bundle_with_equal_timestamp_is_blocked() {
+    fn changed_bundle_with_equal_timestamp_is_imported_as_external_state() {
         let account = chatgpt_account("Stored", Some("acct-one"));
         let auth = AuthDotJson {
             openai_api_key: None,
             tokens: Some(TokenData {
                 id_token: id_token("shared@example.com", Some("acct-one")),
-                access_token: "access-live".to_string(),
+                access_token: access_token(chrono::Utc::now().timestamp() + 7200),
                 refresh_token: "refresh-live".to_string(),
                 account_id: Some("acct-one".to_string()),
             }),
@@ -716,11 +766,76 @@ mod tests {
             ..AccountsStore::default()
         };
 
+        let outcome =
+            reconcile_live_auth(&mut store, &snapshot_for_auth(&auth)).expect("import live auth");
+
+        assert!(outcome.state == LiveAuthState::Newer);
+        assert!(matches!(
+            store.accounts[0].auth_data,
+            AuthData::ChatGPT { ref refresh_token, .. } if refresh_token == "refresh-live"
+        ));
+    }
+
+    #[test]
+    fn clock_rollback_does_not_replace_newer_external_credentials() {
+        let account = chatgpt_account("Stored", Some("acct-one"));
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: id_token("shared@example.com", Some("acct-one")),
+                access_token: access_token(chrono::Utc::now().timestamp() + 7200),
+                refresh_token: "refresh-after-clock-rollback".to_string(),
+                account_id: Some("acct-one".to_string()),
+            }),
+            last_refresh: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        };
+        let mut store = AccountsStore {
+            accounts: vec![account],
+            ..AccountsStore::default()
+        };
+
+        let outcome =
+            reconcile_live_auth(&mut store, &snapshot_for_auth(&auth)).expect("import live auth");
+
+        assert!(outcome.state == LiveAuthState::Newer);
+        assert!(matches!(
+            store.accounts[0].auth_data,
+            AuthData::ChatGPT { ref refresh_token, .. }
+                if refresh_token == "refresh-after-clock-rollback"
+        ));
+    }
+
+    #[test]
+    fn malformed_changed_live_tokens_cannot_replace_stored_credentials() {
+        let account = chatgpt_account("Stored", Some("acct-one"));
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: "malformed-id-token".to_string(),
+                access_token: "malformed-access-token".to_string(),
+                refresh_token: "refresh-live".to_string(),
+                account_id: Some("acct-one".to_string()),
+            }),
+            last_refresh: Some(chrono::Utc::now()),
+        };
+        let mut store = AccountsStore {
+            accounts: vec![account],
+            ..AccountsStore::default()
+        };
+
         let error = reconcile_live_auth(&mut store, &snapshot_for_auth(&auth))
             .err()
-            .expect("equal timestamp should fail");
+            .expect("malformed live auth should fail");
 
-        assert!(error.to_string().contains("unchanged refresh timestamp"));
+        assert!(error.to_string().contains("malformed ChatGPT tokens"));
+        assert!(matches!(
+            store.accounts[0].auth_data,
+            AuthData::ChatGPT { ref refresh_token, .. } if refresh_token == "refresh-stored"
+        ));
     }
 
     #[test]

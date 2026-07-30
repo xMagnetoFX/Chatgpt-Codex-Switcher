@@ -53,6 +53,11 @@ pub struct StoredAccount {
     pub created_at: DateTime<Utc>,
     /// Last time this account was used
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Fingerprints of credential generations replaced by local refreshes.
+    /// Reconciliation uses the full history to recognize live auth that is more than one
+    /// rotation behind without trusting wall-clock ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_chatgpt_credential_hashes: Vec<String>,
 }
 
 impl StoredAccount {
@@ -67,6 +72,7 @@ impl StoredAccount {
             auth_data: AuthData::ApiKey { key: api_key },
             created_at: Utc::now(),
             last_used_at: None,
+            previous_chatgpt_credential_hashes: Vec::new(),
         }
     }
 
@@ -119,6 +125,7 @@ impl StoredAccount {
             },
             created_at: Utc::now(),
             last_used_at: None,
+            previous_chatgpt_credential_hashes: Vec::new(),
         }
     }
 }

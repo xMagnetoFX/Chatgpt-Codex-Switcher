@@ -10,6 +10,7 @@ interface AccountCardProps {
   onDelete: () => void;
   onRename: (newName: string) => Promise<void>;
   switching?: boolean;
+  switchInProgress?: boolean;
   switchDisabled?: boolean;
   restartSwitchEnabled?: boolean;
   masked?: boolean;
@@ -60,6 +61,7 @@ export function AccountCard({
   onDelete,
   onRename,
   switching,
+  switchInProgress,
   switchDisabled,
   restartSwitchEnabled = true,
   masked = false,
@@ -199,7 +201,7 @@ export function AccountCard({
               <button
                 type="button"
                 onClick={onSwitch}
-                disabled={switching || switchIsLocked}
+                disabled={switching || switchInProgress || switchIsLocked}
                 className="btn-primary flex-1"
               >
                 {switching
@@ -302,7 +304,7 @@ export function AccountCard({
         <button
           type="button"
           onClick={onSwitch}
-          disabled={switching || switchIsLocked}
+          disabled={switching || switchInProgress || switchIsLocked}
           className="btn-switch"
           title={
             switchDisabled

@@ -239,6 +239,7 @@ export function HomeDashboard({
           onDelete={() => onDelete(activeAccount.id)}
           onRename={(newName) => onRename(activeAccount.id, newName)}
           switching={switchingId === activeAccount.id}
+          switchInProgress={switchingId !== null}
           switchDisabled={hasRunningProcesses}
           restartSwitchEnabled={restartSwitchEnabled}
           masked={maskedAccounts.has(activeAccount.id)}
@@ -281,6 +282,7 @@ export function HomeDashboard({
                 onDelete={() => onDelete(account.id)}
                 onRename={(newName) => onRename(account.id, newName)}
                 switching={switchingId === account.id}
+                switchInProgress={switchingId !== null}
                 switchDisabled={hasRunningProcesses}
                 restartSwitchEnabled={restartSwitchEnabled}
                 masked={maskedAccounts.has(account.id)}

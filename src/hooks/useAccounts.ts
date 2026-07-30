@@ -19,6 +19,7 @@ export function useAccounts() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const accountsRef = useRef<AccountWithUsage[]>([]);
+  const loadRequestIdRef = useRef(0);
   const maxConcurrentUsageRequests = 10;
 
   useEffect(() => {
@@ -62,10 +63,13 @@ export function useAccounts() {
   );
 
   const loadAccounts = useCallback(async (preserveUsage = false) => {
+    const requestId = ++loadRequestIdRef.current;
+    setLoading(true);
+    setError(null);
+
     try {
-      setLoading(true);
-      setError(null);
       const accountList = await invokeBackend<AccountInfo[]>("list_accounts");
+      if (requestId !== loadRequestIdRef.current) return accountList;
 
       if (preserveUsage) {
         // Preserve existing usage data when just updating account info
@@ -84,10 +88,14 @@ export function useAccounts() {
       }
       return accountList;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      return [];
+      if (requestId === loadRequestIdRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -149,6 +157,18 @@ export function useAccounts() {
     [buildUsageError, maxConcurrentUsageRequests, runWithConcurrency]
   );
 
+  const reloadAfterMutation = useCallback(
+    async (preserveUsage = false, refreshLoadedUsage = false) => {
+      try {
+        const accountList = await loadAccounts(preserveUsage);
+        if (refreshLoadedUsage) await refreshUsage(accountList);
+      } catch (err) {
+        console.error("The account change succeeded, but reloading the account list failed:", err);
+      }
+    },
+    [loadAccounts, refreshUsage]
+  );
+
   const refreshSingleUsage = useCallback(async (accountId: string) => {
     try {
       setAccounts((prev) =>
@@ -207,48 +227,52 @@ export function useAccounts() {
     async (accountId: string) => {
       try {
         await invokeBackend("switch_account", { accountId });
-        await loadAccounts(true); // Preserve usage data
       } catch (err) {
+        await reloadAfterMutation(true);
         throw err;
       }
+      await reloadAfterMutation(true);
     },
-    [loadAccounts]
+    [reloadAfterMutation]
   );
 
   const restartCodexAndSwitchAccount = useCallback(
     async (accountId: string) => {
       try {
         await invokeBackend("restart_codex_and_switch_account", { accountId });
-        await loadAccounts(true); // Preserve usage data
       } catch (err) {
+        await reloadAfterMutation(true);
         throw err;
       }
+      await reloadAfterMutation(true);
     },
-    [loadAccounts]
+    [reloadAfterMutation]
   );
 
   const deleteAccount = useCallback(
     async (accountId: string) => {
       try {
         await invokeBackend("delete_account", { accountId });
-        await loadAccounts();
       } catch (err) {
+        await reloadAfterMutation();
         throw err;
       }
+      await reloadAfterMutation();
     },
-    [loadAccounts]
+    [reloadAfterMutation]
   );
 
   const renameAccount = useCallback(
     async (accountId: string, newName: string) => {
       try {
         await invokeBackend("rename_account", { accountId, newName });
-        await loadAccounts(true); // Preserve usage data
       } catch (err) {
+        await reloadAfterMutation(true);
         throw err;
       }
+      await reloadAfterMutation(true);
     },
-    [loadAccounts]
+    [reloadAfterMutation]
   );
 
   const importFromFile = useCallback(
@@ -262,13 +286,13 @@ export function useAccounts() {
             contents,
           });
         }
-        const accountList = await loadAccounts();
-        await refreshUsage(accountList);
       } catch (err) {
+        await reloadAfterMutation(false, true);
         throw err;
       }
+      await reloadAfterMutation(false, true);
     },
-    [loadAccounts, refreshUsage]
+    [reloadAfterMutation]
   );
 
   const startOAuthLogin = useCallback(async () => {
@@ -281,15 +305,16 @@ export function useAccounts() {
   }, []);
 
   const completeOAuthLogin = useCallback(async () => {
+    let account: AccountInfo;
     try {
-      const account = await invokeBackend<AccountInfo>("complete_login");
-      const accountList = await loadAccounts();
-      await refreshUsage(accountList);
-      return account;
+      account = await invokeBackend<AccountInfo>("complete_login");
     } catch (err) {
+      await reloadAfterMutation(false, true);
       throw err;
     }
-  }, [loadAccounts, refreshUsage]);
+    await reloadAfterMutation(false, true);
+    return account;
+  }, [reloadAfterMutation]);
 
   const exportAccountsSlimText = useCallback(async () => {
     try {
@@ -301,18 +326,19 @@ export function useAccounts() {
 
   const importAccountsSlimText = useCallback(
     async (payload: string) => {
+      let summary: ImportAccountsSummary;
       try {
-        const summary = await invokeBackend<ImportAccountsSummary>("import_accounts_slim_text", {
+        summary = await invokeBackend<ImportAccountsSummary>("import_accounts_slim_text", {
           payload,
         });
-        const accountList = await loadAccounts();
-        await refreshUsage(accountList);
-        return summary;
       } catch (err) {
+        await reloadAfterMutation(false, true);
         throw err;
       }
+      await reloadAfterMutation(false, true);
+      return summary;
     },
-    [loadAccounts, refreshUsage]
+    [reloadAfterMutation]
   );
 
   const exportAccountsFullEncryptedFile = useCallback(async (path: string) => {
@@ -325,19 +351,20 @@ export function useAccounts() {
 
   const importAccountsFullEncryptedFile = useCallback(
     async (path: string) => {
+      let summary: ImportAccountsSummary;
       try {
-        const summary = await invokeBackend<ImportAccountsSummary>(
+        summary = await invokeBackend<ImportAccountsSummary>(
           "import_accounts_full_encrypted_file",
           { path }
         );
-        const accountList = await loadAccounts();
-        await refreshUsage(accountList);
-        return summary;
       } catch (err) {
+        await reloadAfterMutation(false, true);
         throw err;
       }
+      await reloadAfterMutation(false, true);
+      return summary;
     },
-    [loadAccounts, refreshUsage]
+    [reloadAfterMutation]
   );
 
   const cancelOAuthLogin = useCallback(async () => {
