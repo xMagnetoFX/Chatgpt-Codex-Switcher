@@ -1,46 +1,155 @@
 name: Build release installers
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag to upload installers to"
+      ref:
+        description: "Git branch, tag, or commit to build"
         required: true
-        default: "v1.0.0"
+        default: "main"
+        type: string
+      publish:
+        description: "Publish a GitHub release from an existing version tag"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Resolve and validate build
+    runs-on: ubuntu-22.04
+    outputs:
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+      version: ${{ steps.release.outputs.version }}
+    env:
+      BUILD_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}
+      SHOULD_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Verify version files
+        run: corepack pnpm version:check
+
+      - name: Resolve release inputs
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit_sha="$(git rev-parse HEAD)"
+          version="$(node -p "require('./package.json').version")"
+          release_tag=""
+          should_publish="false"
+
+          if [[ "$SHOULD_PUBLISH" == "true" ]]; then
+            EXPECTED_TAG="$RELEASE_TAG" node scripts/verify-version.mjs
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "$tag_commit" != "$commit_sha" ]]; then
+              echo "Release tag $RELEASE_TAG does not point to checked-out commit $commit_sha" >&2
+              exit 1
+            fi
+            release_tag="$RELEASE_TAG"
+            should_publish="true"
+          fi
+
+          printf 'commit_sha=%s\n' "$commit_sha" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.label }} installers
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: Windows
+          - label: Windows x64
             os: windows-latest
-          - label: macOS
-            os: macos-latest
-          - label: Linux
+            rust_targets: x86_64-pc-windows-msvc
+            tauri_target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact_name: windows-x64-installers
+            artifact_paths: |
+              build/tauri-target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              build/tauri-target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          - label: Linux x64
             os: ubuntu-22.04
+            rust_targets: x86_64-unknown-linux-gnu
+            tauri_target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact_name: linux-x64-packages
+            artifact_paths: |
+              build/tauri-target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              build/tauri-target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              build/tauri-target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          - label: macOS universal
+            os: macos-15
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri_target: universal-apple-darwin
+            bundles: dmg
+            artifact_name: macos-universal-dmg
+            artifact_paths: |
+              build/tauri-target/universal-apple-darwin/release/bundle/dmg/*.dmg
+    env:
+      CI: true
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/tauri-target
 
     steps:
-      - name: Checkout release tag
+      - name: Checkout validated commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
+      - name: Verify macOS runner architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libfuse2 \
             librsvg2-dev \
-            patchelf
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            rpm \
+            wget
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -52,24 +161,114 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
 
       - name: Install frontend dependencies
         run: corepack pnpm install --frozen-lockfile
 
-      - name: Build Tauri bundles
-        run: corepack pnpm build:app
+      - name: Typecheck frontend
+        run: corepack pnpm typecheck
 
-      - name: Upload installers to release
+      - name: Test frontend
+        run: corepack pnpm test
+
+      - name: Test Rust serially
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets -- --test-threads=1
+
+      - name: Build Tauri packages
+        run: corepack pnpm tauri build --ci --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
+
+      - name: Upload platform packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_publish == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: downloaded-packages
+          merge-multiple: true
+
+      - name: Prepare release assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir release-assets
+          declare -A package_counts=(
+            [appimage]=0
+            [deb]=0
+            [dmg]=0
+            [exe]=0
+            [msi]=0
+            [rpm]=0
+          )
+
+          while IFS= read -r -d '' package; do
+            case "$package" in
+              *.AppImage) kind="appimage" ;;
+              *.deb) kind="deb" ;;
+              *.dmg) kind="dmg" ;;
+              *.exe) kind="exe" ;;
+              *.msi) kind="msi" ;;
+              *.rpm) kind="rpm" ;;
+              *)
+                echo "Unexpected release artifact: $package" >&2
+                exit 1
+                ;;
+            esac
+
+            destination="release-assets/$(basename "$package")"
+            if [[ -e "$destination" ]]; then
+              echo "Duplicate release filename: $(basename "$package")" >&2
+              exit 1
+            fi
+
+            cp "$package" "$destination"
+            package_counts[$kind]=$((package_counts[$kind] + 1))
+          done < <(find downloaded-packages -type f -print0)
+
+          for kind in "${!package_counts[@]}"; do
+            if [[ "${package_counts[$kind]}" -ne 1 ]]; then
+              echo "Expected one $kind package, found ${package_counts[$kind]}" >&2
+              exit 1
+            fi
+          done
+
+          (
+            cd release-assets
+            sha256sum -- * > SHA256SUMS.txt
+          )
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag }}
-          fail_on_unmatched_files: false
-          files: |
-            build/tauri-target/release/bundle/**/*.msi
-            build/tauri-target/release/bundle/**/*.exe
-            build/tauri-target/release/bundle/**/*.dmg
-            build/tauri-target/release/bundle/**/*.app.tar.gz
-            build/tauri-target/release/bundle/**/*.deb
-            build/tauri-target/release/bundle/**/*.rpm
-            build/tauri-target/release/bundle/**/*.AppImage
-            build/tauri-target/release/bundle/**/*.json
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ChatGPT Codex Switcher ${{ needs.prepare.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Unsigned build warning
+
+            These installers are not code-signed. Windows SmartScreen and macOS Gatekeeper may show a warning before installation.
+
+            This unsigned release does not include Tauri updater signatures or `latest.json`, so automatic in-app updates are not available for this version.
+          files: release-assets/*

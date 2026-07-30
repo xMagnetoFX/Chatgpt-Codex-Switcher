@@ -19,6 +19,7 @@
     "build:app:signed": "corepack pnpm tauri build --signed",
     "tauri": "node scripts/tauri.mjs",
     "lan": "node scripts/lan.mjs",
+    "version:check": "node scripts/verify-version.mjs",
     "version:bump": "node scripts/bump-version.mjs",
     "version:patch": "node scripts/bump-version.mjs patch",
     "version:minor": "node scripts/bump-version.mjs minor",
