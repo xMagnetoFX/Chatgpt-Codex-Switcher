@@ -2,9 +2,11 @@
 
 use crate::auth::{
     add_account, add_account_with_auto_name, create_chatgpt_account_from_refresh_token,
-    get_active_account, get_full_backup_key, get_or_create_full_backup_key, import_from_auth_json,
+    ensure_chatgpt_tokens_fresh_for_activation_with_client, get_account, get_active_account,
+    get_full_backup_key, get_or_create_full_backup_key, import_from_auth_json,
     import_from_auth_json_contents, load_accounts, merge_imported_accounts, remove_account,
-    set_active_account, touch_account,
+    set_active_account, sync_active_account_from_current_auth, touch_account,
+    ChatGptTokenRefreshClient, HttpChatGptTokenRefreshClient,
 };
 use crate::commands::process::{
     ensure_switch_allowed, prepare_codex_restart_plan, restart_antigravity_background_processes,
@@ -141,11 +143,29 @@ fn add_imported_account(account: StoredAccount) -> anyhow::Result<StoredAccount>
 /// Switch to a different account
 #[tauri::command]
 pub async fn switch_account(account_id: String) -> Result<(), String> {
-    // Process polling and store locking can block for seconds; keep that off
-    // the async worker threads.
+    switch_account_with_client(account_id, &HttpChatGptTokenRefreshClient).await
+}
+
+async fn switch_account_with_client<C>(account_id: String, client: &C) -> Result<(), String>
+where
+    C: ChatGptTokenRefreshClient + ?Sized,
+{
+    let initial_account_id = account_id.clone();
     tokio::task::spawn_blocking(move || {
         ensure_switch_allowed().map_err(|e| e.to_string())?;
-        ensure_account_exists(&account_id)?;
+        ensure_account_exists(&initial_account_id)?;
+        sync_active_account_from_current_auth().map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Switch preparation task failed: {e}"))??;
+
+    prepare_account_for_activation_with_client(&account_id, client).await?;
+
+    tokio::task::spawn_blocking(move || {
+        // Refreshing can take long enough for Codex to start again, so check
+        // immediately before publishing the selected credentials.
+        ensure_switch_allowed().map_err(|e| e.to_string())?;
         activate_account_on_disk(&account_id)
     })
     .await
@@ -155,20 +175,75 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
 /// Stop running Codex windows, switch accounts, and relaunch Codex.
 #[tauri::command]
 pub async fn restart_codex_and_switch_account(account_id: String) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        ensure_account_exists(&account_id)?;
+    restart_codex_and_switch_account_with_client(account_id, &HttpChatGptTokenRefreshClient).await
+}
 
+async fn restart_codex_and_switch_account_with_client<C>(
+    account_id: String,
+    client: &C,
+) -> Result<(), String>
+where
+    C: ChatGptTokenRefreshClient + ?Sized,
+{
+    let plan_account_id = account_id.clone();
+    let restart_plan = tokio::task::spawn_blocking(move || {
+        ensure_account_exists(&plan_account_id)?;
         let restart_plan = prepare_codex_restart_plan().map_err(|e| e.to_string())?;
         stop_codex_for_restart(&restart_plan).map_err(|e| e.to_string())?;
-        let switch_result = activate_account_on_disk(&account_id);
-        let restart_result =
-            start_codex_from_restart_plan(&restart_plan).map_err(|e| e.to_string());
-
-        switch_result?;
-        restart_result
+        Ok::<_, String>(restart_plan)
     })
     .await
-    .map_err(|e| format!("Restart task failed: {e}"))?
+    .map_err(|e| format!("Restart preparation task failed: {e}"))??;
+
+    let switch_result = async {
+        tokio::task::spawn_blocking(|| {
+            sync_active_account_from_current_auth().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Token sync task failed: {e}"))??;
+
+        prepare_account_for_activation_with_client(&account_id, client).await?;
+
+        let activation_account_id = account_id.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure_switch_allowed().map_err(|e| e.to_string())?;
+            activate_account_on_disk(&activation_account_id)
+        })
+        .await
+        .map_err(|e| format!("Switch task failed: {e}"))?
+    }
+    .await;
+
+    // Once the restart flow stops Codex, always attempt to relaunch it even if
+    // credential synchronization or refresh fails.
+    let restart_result = tokio::task::spawn_blocking(move || {
+        start_codex_from_restart_plan(&restart_plan).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Restart task failed: {e}"))?;
+
+    switch_result?;
+    restart_result
+}
+
+async fn prepare_account_for_activation_with_client<C>(
+    account_id: &str,
+    client: &C,
+) -> Result<(), String>
+where
+    C: ChatGptTokenRefreshClient + ?Sized,
+{
+    let lookup_id = account_id.to_string();
+    let account = tokio::task::spawn_blocking(move || get_account(&lookup_id))
+        .await
+        .map_err(|e| format!("Account lookup task failed: {e}"))?
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+
+    ensure_chatgpt_tokens_fresh_for_activation_with_client(&account, client)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to refresh account '{}': {e}", account.name))
 }
 
 fn ensure_account_exists(account_id: &str) -> Result<(), String> {
@@ -697,7 +772,11 @@ pub async fn set_masked_account_ids(ids: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{add_account, read_current_auth};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+
+    use crate::auth::{add_account, get_account, read_current_auth, RefreshTokenResponse};
 
     struct TestEnv {
         _config_dir: tempfile::TempDir,
@@ -764,6 +843,100 @@ mod tests {
             accounts: vec![account],
             masked_account_ids: vec![],
         }
+    }
+
+    enum FakeRefreshOutcome {
+        Success(RefreshTokenResponse),
+        Failure(&'static str),
+    }
+
+    struct FakeRefreshClient {
+        calls: AtomicUsize,
+        outcome: FakeRefreshOutcome,
+    }
+
+    impl FakeRefreshClient {
+        fn success(response: RefreshTokenResponse) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome: FakeRefreshOutcome::Success(response),
+            }
+        }
+
+        fn failure(message: &'static str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome: FakeRefreshOutcome::Failure(message),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ChatGptTokenRefreshClient for FakeRefreshClient {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<RefreshTokenResponse>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match &self.outcome {
+                    FakeRefreshOutcome::Success(response) => Ok(response.clone()),
+                    FakeRefreshOutcome::Failure(message) => anyhow::bail!(*message),
+                }
+            })
+        }
+    }
+
+    struct ProcessStartingRefreshClient {
+        response: RefreshTokenResponse,
+    }
+
+    impl ChatGptTokenRefreshClient for ProcessStartingRefreshClient {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<RefreshTokenResponse>> {
+            Box::pin(async move {
+                std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "1");
+                Ok(self.response.clone())
+            })
+        }
+    }
+
+    fn jwt_with_expiry(expiry: i64) -> String {
+        let payload = serde_json::json!({ "exp": expiry });
+        let encoded =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serialize expiry"));
+        format!("header.{encoded}.signature")
+    }
+
+    fn id_token(email: &str, account_id: &str) -> String {
+        let payload = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": "pro"
+            }
+        });
+        let encoded =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serialize claims"));
+        format!("header.{encoded}.signature")
+    }
+
+    fn chatgpt_account(access_token: String) -> StoredAccount {
+        StoredAccount::new_chatgpt_with_last_refresh(
+            "ChatGPT".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            access_token,
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        )
     }
 
     #[test]
@@ -846,6 +1019,182 @@ mod tests {
         assert!(result
             .expect_err("switch should fail")
             .contains("Close all running Codex windows"));
+    }
+
+    // These tests intentionally hold the env lock across await to serialize
+    // process-wide environment mutation while the async command reads it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn switch_account_refreshes_expired_chatgpt_before_writing_auth() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let primary = add_account(StoredAccount::new_api_key(
+            "Primary".to_string(),
+            "sk-primary".to_string(),
+        ))
+        .expect("add primary account");
+        let target = add_account(chatgpt_account(jwt_with_expiry(
+            chrono::Utc::now().timestamp() - 60,
+        )))
+        .expect("add target account");
+        let client = FakeRefreshClient::success(RefreshTokenResponse {
+            id_token: Some(id_token("user@example.com", "acct-one")),
+            access_token: jwt_with_expiry(chrono::Utc::now().timestamp() + 3600),
+            refresh_token: Some("refresh-new".to_string()),
+        });
+        std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "0");
+
+        switch_account_with_client(target.id.clone(), &client)
+            .await
+            .expect("switch should succeed");
+
+        assert_eq!(client.call_count(), 1);
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(store.active_account_id.as_deref(), Some(target.id.as_str()));
+        assert_ne!(
+            store.active_account_id.as_deref(),
+            Some(primary.id.as_str())
+        );
+        let stored_target = get_account(&target.id)
+            .expect("load target")
+            .expect("target should exist");
+        assert!(matches!(
+            stored_target.auth_data,
+            AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-new"
+        ));
+        let auth = read_current_auth()
+            .expect("read auth")
+            .expect("auth should exist");
+        assert_eq!(
+            auth.tokens.expect("tokens should exist").refresh_token,
+            "refresh-new"
+        );
+    }
+
+    // These tests intentionally hold the env lock across await to serialize
+    // process-wide environment mutation while the async command reads it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn switch_account_refresh_failure_preserves_previous_active_auth() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let primary = add_account(StoredAccount::new_api_key(
+            "Primary".to_string(),
+            "sk-primary".to_string(),
+        ))
+        .expect("add primary account");
+        let target = add_account(chatgpt_account(jwt_with_expiry(
+            chrono::Utc::now().timestamp() - 60,
+        )))
+        .expect("add target account");
+        let auth_before = serde_json::to_value(
+            read_current_auth()
+                .expect("read auth")
+                .expect("auth should exist"),
+        )
+        .expect("serialize auth");
+        let client = FakeRefreshClient::failure("provider rejected refresh");
+        std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "0");
+
+        let result = switch_account_with_client(target.id.clone(), &client).await;
+
+        assert!(result.is_err());
+        assert_eq!(client.call_count(), 1);
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some(primary.id.as_str())
+        );
+        let auth_after = serde_json::to_value(
+            read_current_auth()
+                .expect("read auth")
+                .expect("auth should exist"),
+        )
+        .expect("serialize auth");
+        assert_eq!(auth_after, auth_before);
+        let stored_target = get_account(&target.id)
+            .expect("load target")
+            .expect("target should exist");
+        assert!(matches!(
+            stored_target.auth_data,
+            AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-old"
+        ));
+    }
+
+    // These tests intentionally hold the env lock across await to serialize
+    // process-wide environment mutation while the async command reads it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn refresh_does_not_publish_auth_before_final_process_check() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let target = add_account(chatgpt_account(jwt_with_expiry(
+            chrono::Utc::now().timestamp() - 60,
+        )))
+        .expect("add target account");
+        let auth_before = serde_json::to_value(
+            read_current_auth()
+                .expect("read auth")
+                .expect("auth should exist"),
+        )
+        .expect("serialize auth");
+        let client = ProcessStartingRefreshClient {
+            response: RefreshTokenResponse {
+                id_token: Some(id_token("user@example.com", "acct-one")),
+                access_token: jwt_with_expiry(chrono::Utc::now().timestamp() + 3600),
+                refresh_token: Some("refresh-new".to_string()),
+            },
+        };
+        std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "0");
+
+        let result = switch_account_with_client(target.id.clone(), &client).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .expect_err("switch should fail")
+            .contains("Close all running Codex windows"));
+        let auth_after = serde_json::to_value(
+            read_current_auth()
+                .expect("read auth")
+                .expect("auth should exist"),
+        )
+        .expect("serialize auth");
+        assert_eq!(auth_after, auth_before);
+        let stored_target = get_account(&target.id)
+            .expect("load target")
+            .expect("target should exist");
+        assert!(matches!(
+            stored_target.auth_data,
+            AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-new"
+        ));
+    }
+
+    // These tests intentionally hold the env lock across await to serialize
+    // process-wide environment mutation while the async command reads it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn switch_account_with_fresh_chatgpt_token_skips_refresh() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        add_account(StoredAccount::new_api_key(
+            "Primary".to_string(),
+            "sk-primary".to_string(),
+        ))
+        .expect("add primary account");
+        let target = add_account(chatgpt_account(jwt_with_expiry(
+            chrono::Utc::now().timestamp() + 3600,
+        )))
+        .expect("add target account");
+        let client = FakeRefreshClient::failure("refresh must not be called");
+        std::env::set_var("CODEX_SWITCHER_TEST_ACTIVE_CODEX_COUNT", "0");
+
+        switch_account_with_client(target.id.clone(), &client)
+            .await
+            .expect("switch should succeed");
+
+        assert_eq!(client.call_count(), 0);
+        let store = load_accounts().expect("load accounts");
+        assert_eq!(store.active_account_id.as_deref(), Some(target.id.as_str()));
     }
 
     // These tests intentionally hold the env lock across await to serialize

@@ -7,10 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use tempfile::NamedTempFile;
 
-use super::switcher::{clear_current_auth, switch_to_account};
-use crate::types::{AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
+use super::switcher::{
+    clear_current_auth, parse_id_token_account_id, parse_id_token_claims, read_current_auth,
+    switch_to_account,
+};
+use crate::types::{AccountsStore, AuthData, AuthDotJson, ImportAccountsSummary, StoredAccount};
 
 const STORE_FILENAME: &str = "accounts.json";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -227,8 +231,8 @@ impl Drop for StoreLock {
     fn drop(&mut self) {
         // Only remove the lock file if it is still ours. A contender that
         // judged our lock stale may have replaced it with its own.
-        let still_ours = fs::read_to_string(&self.path)
-            .is_ok_and(|contents| contents.contains(&self.token));
+        let still_ours =
+            fs::read_to_string(&self.path).is_ok_and(|contents| contents.contains(&self.token));
         if still_ours {
             let _ = fs::remove_file(&self.path);
         }
@@ -309,7 +313,7 @@ fn lock_is_stale(path: &Path) -> bool {
 /// Add a new account to the store
 pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
     let account_clone = account.clone();
-    mutate_store(true, move |store| {
+    mutate_store_with_sync_decision(move |store| {
         if store
             .accounts
             .iter()
@@ -318,12 +322,13 @@ pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
             anyhow::bail!("An account with name '{}' already exists", account.name);
         }
 
+        let becomes_active = store.accounts.is_empty();
         store.accounts.push(account);
-        if store.accounts.len() == 1 {
+        if becomes_active {
             store.active_account_id = Some(account_clone.id.clone());
         }
 
-        Ok(account_clone)
+        Ok((account_clone, becomes_active))
     })
 }
 
@@ -332,16 +337,17 @@ pub fn add_account_with_auto_name(
     mut account: StoredAccount,
     prefix: &str,
 ) -> Result<StoredAccount> {
-    mutate_store(true, move |store| {
+    mutate_store_with_sync_decision(move |store| {
         account.name = next_auto_account_name(store, prefix);
         let stored = account.clone();
+        let becomes_active = store.accounts.is_empty();
 
         store.accounts.push(account);
-        if store.accounts.len() == 1 {
+        if becomes_active {
             store.active_account_id = Some(stored.id.clone());
         }
 
-        Ok(stored)
+        Ok((stored, becomes_active))
     })
 }
 
@@ -370,25 +376,27 @@ fn next_auto_account_name(store: &AccountsStore, prefix: &str) -> String {
 
 /// Remove an account by ID
 pub fn remove_account(account_id: &str) -> Result<()> {
-    mutate_store(true, |store| {
+    mutate_store_with_sync_decision(|store| {
         let initial_len = store.accounts.len();
+        let removed_active = store.active_account_id.as_deref() == Some(account_id);
         store.accounts.retain(|account| account.id != account_id);
 
         if store.accounts.len() == initial_len {
             anyhow::bail!("Account not found: {account_id}");
         }
 
-        if store.active_account_id.as_deref() == Some(account_id) {
+        if removed_active {
             store.active_account_id = store.accounts.first().map(|account| account.id.clone());
         }
 
-        Ok(())
+        Ok(((), removed_active))
     })
 }
 
 /// Update the active account ID
 pub fn set_active_account(account_id: &str) -> Result<()> {
-    mutate_store(true, |store| {
+    let current_auth = read_current_auth()?;
+    mutate_store_with_sync_decision(move |store| {
         if !store
             .accounts
             .iter()
@@ -397,14 +405,22 @@ pub fn set_active_account(account_id: &str) -> Result<()> {
             anyhow::bail!("Account not found: {account_id}");
         }
 
+        if let Some(auth) = current_auth.as_ref() {
+            sync_current_auth_into_active_store(store, auth);
+        }
         store.active_account_id = Some(account_id.to_string());
-        Ok(())
+        Ok(((), true))
     })
 }
 
 /// Merge imported accounts into the local store, skipping duplicate ids and names.
 pub fn merge_imported_accounts(imported: AccountsStore) -> Result<ImportAccountsSummary> {
-    mutate_store(true, move |store| Ok(merge_accounts_store(store, imported)))
+    mutate_store_with_sync_decision(move |store| {
+        let previous_active = store.active_account_id.clone();
+        let summary = merge_accounts_store(store, imported);
+        let active_changed = store.active_account_id != previous_active;
+        Ok((summary, active_changed))
+    })
 }
 
 fn merge_accounts_store(
@@ -554,7 +570,7 @@ pub fn update_account_metadata(
     })
 }
 
-/// Update ChatGPT OAuth tokens for an account and return the updated account.
+/// Update freshly obtained ChatGPT OAuth tokens for an account.
 pub fn update_account_chatgpt_tokens(
     account_id: &str,
     id_token: String,
@@ -564,16 +580,77 @@ pub fn update_account_chatgpt_tokens(
     email: Option<String>,
     plan_type: Option<String>,
 ) -> Result<StoredAccount> {
-    // Only re-sync auth.json when the refreshed account is the active one.
-    // Rewriting it for background refreshes could clobber tokens a running
-    // Codex CLI just rotated on its own.
+    update_account_chatgpt_tokens_with_last_refresh(
+        account_id,
+        None,
+        id_token,
+        access_token,
+        refresh_token,
+        chatgpt_account_id,
+        email,
+        plan_type,
+        Some(Utc::now()),
+        true,
+    )
+}
+
+pub(crate) fn update_account_chatgpt_tokens_after_refresh(
+    account_id: &str,
+    expected_refresh_token: &str,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    chatgpt_account_id: Option<String>,
+    email: Option<String>,
+    plan_type: Option<String>,
+    sync_active_auth: bool,
+) -> Result<StoredAccount> {
+    update_account_chatgpt_tokens_with_last_refresh(
+        account_id,
+        Some(expected_refresh_token),
+        id_token,
+        access_token,
+        refresh_token,
+        chatgpt_account_id,
+        email,
+        plan_type,
+        Some(Utc::now()),
+        sync_active_auth,
+    )
+}
+
+fn update_account_chatgpt_tokens_with_last_refresh(
+    account_id: &str,
+    expected_refresh_token: Option<&str>,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    chatgpt_account_id: Option<String>,
+    email: Option<String>,
+    plan_type: Option<String>,
+    last_refresh: Option<DateTime<Utc>>,
+    sync_active_auth: bool,
+) -> Result<StoredAccount> {
+    // Only re-sync auth.json when the refreshed account is active and the
+    // caller did not request deferred publication for a switch operation.
     mutate_store_with_sync_decision(|store| {
-        let is_active = store.active_account_id.as_deref() == Some(account_id);
+        let should_sync =
+            sync_active_auth && store.active_account_id.as_deref() == Some(account_id);
         let account = store
             .accounts
             .iter_mut()
             .find(|account| account.id == account_id)
             .context("Account not found")?;
+
+        if let Some(expected) = expected_refresh_token {
+            match &account.auth_data {
+                AuthData::ChatGPT { refresh_token, .. } if refresh_token == expected => {}
+                AuthData::ChatGPT { .. } => return Ok((account.clone(), false)),
+                AuthData::ApiKey { .. } => {
+                    anyhow::bail!("Cannot update OAuth tokens for an API key account");
+                }
+            }
+        }
 
         match &mut account.auth_data {
             AuthData::ChatGPT {
@@ -581,6 +658,7 @@ pub fn update_account_chatgpt_tokens(
                 access_token: stored_access_token,
                 refresh_token: stored_refresh_token,
                 account_id: stored_account_id,
+                last_refresh: stored_last_refresh,
             } => {
                 *stored_id_token = id_token;
                 *stored_access_token = access_token;
@@ -588,6 +666,7 @@ pub fn update_account_chatgpt_tokens(
                 if let Some(new_account_id) = chatgpt_account_id {
                     *stored_account_id = Some(new_account_id);
                 }
+                *stored_last_refresh = last_refresh;
             }
             AuthData::ApiKey { .. } => {
                 anyhow::bail!("Cannot update OAuth tokens for an API key account");
@@ -602,8 +681,186 @@ pub fn update_account_chatgpt_tokens(
             account.plan_type = Some(new_plan_type);
         }
 
-        Ok((account.clone(), is_active))
+        Ok((account.clone(), should_sync))
     })
+}
+
+/// Pull newer credentials written by Codex back into the active Switcher account.
+pub fn sync_active_account_from_current_auth() -> Result<bool> {
+    let Some(current_auth) = read_current_auth()? else {
+        return Ok(false);
+    };
+
+    mutate_store_with_sync_decision(move |store| {
+        let changed = sync_current_auth_into_active_store(store, &current_auth);
+        Ok((changed, false))
+    })
+}
+
+fn sync_current_auth_into_active_store(
+    store: &mut AccountsStore,
+    current_auth: &AuthDotJson,
+) -> bool {
+    let Some(current_tokens) = current_auth.tokens.as_ref() else {
+        return false;
+    };
+    let Some(active_id) = store.active_account_id.as_deref() else {
+        return false;
+    };
+    let Some(active_index) = store
+        .accounts
+        .iter()
+        .position(|account| account.id == active_id)
+    else {
+        return false;
+    };
+
+    let active_account = &store.accounts[active_index];
+    let (
+        stored_id_token,
+        stored_access_token,
+        stored_refresh_token,
+        stored_account_id,
+        stored_last_refresh,
+    ) = match &active_account.auth_data {
+        AuthData::ApiKey { .. } => return false,
+        AuthData::ChatGPT {
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            last_refresh,
+        } => (
+            id_token.as_str(),
+            access_token.as_str(),
+            refresh_token.as_str(),
+            account_id.as_deref(),
+            *last_refresh,
+        ),
+    };
+
+    if !chatgpt_identity_matches(
+        stored_account_id,
+        active_account.email.as_deref(),
+        stored_id_token,
+        current_tokens.account_id.as_deref(),
+        &current_tokens.id_token,
+    ) {
+        return false;
+    }
+
+    let tokens_changed = stored_id_token != current_tokens.id_token
+        || stored_access_token != current_tokens.access_token
+        || stored_refresh_token != current_tokens.refresh_token
+        || stored_account_id != current_tokens.account_id.as_deref();
+
+    if !current_auth_is_newer(
+        stored_last_refresh,
+        current_auth.last_refresh,
+        tokens_changed,
+    ) {
+        return false;
+    }
+
+    let (email, plan_type) = parse_id_token_claims(&current_tokens.id_token);
+    let active_account = &mut store.accounts[active_index];
+    let AuthData::ChatGPT {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+        last_refresh,
+    } = &mut active_account.auth_data
+    else {
+        return false;
+    };
+
+    id_token.clone_from(&current_tokens.id_token);
+    access_token.clone_from(&current_tokens.access_token);
+    refresh_token.clone_from(&current_tokens.refresh_token);
+    if let Some(current_account_id) = current_tokens.account_id.as_ref() {
+        account_id.clone_from(&Some(current_account_id.clone()));
+    }
+    *last_refresh = current_auth.last_refresh;
+    if let Some(email) = email {
+        active_account.email = Some(email);
+    }
+    if let Some(plan_type) = plan_type {
+        active_account.plan_type = Some(plan_type);
+    }
+
+    true
+}
+
+fn current_auth_is_newer(
+    stored_last_refresh: Option<DateTime<Utc>>,
+    current_last_refresh: Option<DateTime<Utc>>,
+    tokens_changed: bool,
+) -> bool {
+    match (current_last_refresh, stored_last_refresh) {
+        (Some(current), Some(stored)) => current > stored || (tokens_changed && current == stored),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+fn chatgpt_identity_matches(
+    stored_account_id: Option<&str>,
+    stored_email: Option<&str>,
+    stored_id_token: &str,
+    current_account_id: Option<&str>,
+    current_id_token: &str,
+) -> bool {
+    let Ok(stored_account_id) = resolved_chatgpt_account_id(stored_account_id, stored_id_token)
+    else {
+        return false;
+    };
+    let Ok(current_account_id) = resolved_chatgpt_account_id(current_account_id, current_id_token)
+    else {
+        return false;
+    };
+
+    match (stored_account_id.as_deref(), current_account_id.as_deref()) {
+        (Some(stored), Some(current)) => return stored == current,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+
+    let parsed_stored_email = parse_id_token_claims(stored_id_token).0;
+    let parsed_current_email = parse_id_token_claims(current_id_token).0;
+    let stored_email = stored_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .or_else(|| parsed_stored_email.as_deref());
+    let current_email = parsed_current_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty());
+
+    matches!(
+        (stored_email, current_email),
+        (Some(stored), Some(current)) if stored.eq_ignore_ascii_case(current)
+    )
+}
+
+fn resolved_chatgpt_account_id(
+    explicit_account_id: Option<&str>,
+    id_token: &str,
+) -> std::result::Result<Option<String>, ()> {
+    let explicit = explicit_account_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from);
+    let embedded = parse_id_token_account_id(id_token)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+
+    match (explicit, embedded) {
+        (Some(explicit), Some(embedded)) if explicit != embedded => Err(()),
+        (Some(explicit), _) => Ok(Some(explicit)),
+        (None, Some(embedded)) => Ok(Some(embedded)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Get the list of masked account IDs
@@ -623,7 +880,10 @@ pub fn set_masked_account_ids(ids: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::switcher::read_current_auth;
+    use crate::auth::switcher::{
+        import_from_auth_json_contents, read_current_auth, switch_to_account,
+    };
+    use base64::Engine as _;
 
     struct TestEnv {
         _config_dir: tempfile::TempDir,
@@ -679,6 +939,25 @@ mod tests {
             format!("refresh-{token_suffix}"),
             Some(format!("acct-{token_suffix}")),
         )
+    }
+
+    fn id_token(email: &str, account_id: &str) -> String {
+        let payload = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": "plus"
+            }
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize claims"));
+        format!("header.{encoded}.signature")
+    }
+
+    fn timestamp(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid timestamp")
+            .with_timezone(&Utc)
     }
 
     #[test]
@@ -745,6 +1024,101 @@ mod tests {
     }
 
     #[test]
+    fn adding_or_merging_background_accounts_does_not_rewrite_current_auth() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let old_refresh = timestamp("2026-07-20T00:00:00Z");
+        let new_refresh = timestamp("2026-07-21T00:00:00Z");
+        add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "Active".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-old".to_string(),
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(old_refresh),
+        ))
+        .expect("add active account");
+        let current = StoredAccount::new_chatgpt_with_last_refresh(
+            "Current Codex".to_string(),
+            Some("user@example.com".to_string()),
+            Some("pro".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-new".to_string(),
+            "refresh-new".to_string(),
+            Some("acct-one".to_string()),
+            Some(new_refresh),
+        );
+        switch_to_account(&current).expect("write current auth");
+        let auth_path = crate::auth::switcher::get_codex_auth_file().expect("auth path");
+        let auth_before = fs::read(&auth_path).expect("read auth before background changes");
+
+        add_account(api_account("Background", "sk-background")).expect("add background");
+        merge_imported_accounts(AccountsStore {
+            version: 1,
+            accounts: vec![api_account("Imported", "sk-imported")],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        })
+        .expect("merge background account");
+
+        assert_eq!(
+            fs::read(&auth_path).expect("read auth after background changes"),
+            auth_before
+        );
+    }
+
+    #[test]
+    fn activating_another_account_first_preserves_newer_current_credentials() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let old_refresh = timestamp("2026-07-20T00:00:00Z");
+        let new_refresh = timestamp("2026-07-21T00:00:00Z");
+        let active = add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "Active".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-old".to_string(),
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(old_refresh),
+        ))
+        .expect("add active account");
+        let target = add_account(api_account("Target", "sk-target")).expect("add target");
+        let current = StoredAccount::new_chatgpt_with_last_refresh(
+            "Current Codex".to_string(),
+            Some("user@example.com".to_string()),
+            Some("pro".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-new".to_string(),
+            "refresh-new".to_string(),
+            Some("acct-one".to_string()),
+            Some(new_refresh),
+        );
+        switch_to_account(&current).expect("write current auth");
+
+        set_active_account(&target.id).expect("activate target");
+
+        let preserved = get_account(&active.id)
+            .expect("load old active")
+            .expect("old active should exist");
+        assert!(matches!(
+            preserved.auth_data,
+            AuthData::ChatGPT {
+                refresh_token,
+                last_refresh: Some(actual_refresh),
+                ..
+            } if refresh_token == "refresh-new" && actual_refresh == new_refresh
+        ));
+        let auth = read_current_auth()
+            .expect("read auth")
+            .expect("target auth should exist");
+        assert_eq!(auth.openai_api_key.as_deref(), Some("sk-target"));
+    }
+
+    #[test]
     fn updating_active_chatgpt_tokens_keeps_auth_json_in_sync() {
         let _guard = crate::test_support::env_lock();
         let _env = TestEnv::new();
@@ -770,6 +1144,285 @@ mod tests {
         assert_eq!(tokens.access_token, "access-new");
         assert_eq!(tokens.refresh_token, "refresh-new");
         assert_eq!(tokens.account_id.as_deref(), Some("acct-new"));
+    }
+
+    #[test]
+    fn writing_chatgpt_auth_preserves_stored_last_refresh() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let expected = timestamp("2026-07-20T12:34:56Z");
+        let account = StoredAccount::new_chatgpt_with_last_refresh(
+            "ChatGPT".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-old".to_string(),
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(expected),
+        );
+
+        add_account(account).expect("add account");
+        let auth = read_current_auth()
+            .expect("read auth")
+            .expect("auth should exist");
+
+        assert_eq!(auth.last_refresh, Some(expected));
+    }
+
+    #[test]
+    fn importing_chatgpt_auth_preserves_last_refresh() {
+        let expected = timestamp("2026-07-21T01:02:03Z");
+        let auth = crate::types::AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(crate::types::TokenData {
+                id_token: id_token("user@example.com", "acct-one"),
+                access_token: "access-imported".to_string(),
+                refresh_token: "refresh-imported".to_string(),
+                account_id: Some("acct-one".to_string()),
+            }),
+            last_refresh: Some(expected),
+        };
+        let contents = serde_json::to_string(&auth).expect("serialize auth");
+
+        let imported =
+            import_from_auth_json_contents(&contents, "Imported".to_string()).expect("import auth");
+
+        assert!(matches!(
+            imported.auth_data,
+            AuthData::ChatGPT {
+                last_refresh: Some(actual),
+                ..
+            } if actual == expected
+        ));
+    }
+
+    #[test]
+    fn syncs_newer_current_auth_into_active_account_without_rewriting_auth_file() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let old_refresh = timestamp("2026-07-20T00:00:00Z");
+        let new_refresh = timestamp("2026-07-21T00:00:00Z");
+        let stored = add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "ChatGPT".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-old".to_string(),
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(old_refresh),
+        ))
+        .expect("add account");
+        let current = StoredAccount::new_chatgpt_with_last_refresh(
+            "Current Codex".to_string(),
+            Some("user@example.com".to_string()),
+            Some("pro".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-new".to_string(),
+            "refresh-new".to_string(),
+            Some("acct-one".to_string()),
+            Some(new_refresh),
+        );
+        switch_to_account(&current).expect("write newer current auth");
+        let auth_path = crate::auth::switcher::get_codex_auth_file().expect("auth path");
+        let auth_before = fs::read(&auth_path).expect("read current auth bytes");
+
+        assert!(sync_active_account_from_current_auth().expect("sync current auth"));
+
+        let auth_after = fs::read(&auth_path).expect("read current auth bytes again");
+        assert_eq!(auth_after, auth_before, "sync must not rewrite auth.json");
+        let updated = get_account(&stored.id)
+            .expect("load account")
+            .expect("account should exist");
+        assert!(matches!(
+            updated.auth_data,
+            AuthData::ChatGPT {
+                access_token,
+                refresh_token,
+                last_refresh: Some(actual_refresh),
+                ..
+            } if access_token == "access-new"
+                && refresh_token == "refresh-new"
+                && actual_refresh == new_refresh
+        ));
+    }
+
+    #[test]
+    fn refuses_to_sync_current_auth_for_a_different_chatgpt_identity() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let old_refresh = timestamp("2026-07-20T00:00:00Z");
+        let new_refresh = timestamp("2026-07-21T00:00:00Z");
+        let stored = add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "ChatGPT".to_string(),
+            Some("first@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("first@example.com", "acct-one"),
+            "access-old".to_string(),
+            "refresh-old".to_string(),
+            Some("acct-one".to_string()),
+            Some(old_refresh),
+        ))
+        .expect("add account");
+        let other = StoredAccount::new_chatgpt_with_last_refresh(
+            "Other".to_string(),
+            Some("other@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("other@example.com", "acct-two"),
+            "access-other".to_string(),
+            "refresh-other".to_string(),
+            Some("acct-two".to_string()),
+            Some(new_refresh),
+        );
+        switch_to_account(&other).expect("write other auth");
+
+        assert!(!sync_active_account_from_current_auth().expect("check current auth"));
+
+        let unchanged = get_account(&stored.id)
+            .expect("load account")
+            .expect("account should exist");
+        assert!(matches!(
+            unchanged.auth_data,
+            AuthData::ChatGPT { access_token, .. } if access_token == "access-old"
+        ));
+    }
+
+    #[test]
+    fn refuses_same_email_sync_when_chatgpt_account_ids_differ() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let old_refresh = timestamp("2026-07-20T00:00:00Z");
+        let new_refresh = timestamp("2026-07-21T00:00:00Z");
+        let stored = add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "Workspace A".to_string(),
+            Some("shared@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("shared@example.com", "acct-a"),
+            "access-a".to_string(),
+            "refresh-a".to_string(),
+            None,
+            Some(old_refresh),
+        ))
+        .expect("add account");
+        let other_workspace = StoredAccount::new_chatgpt_with_last_refresh(
+            "Workspace B".to_string(),
+            Some("shared@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("shared@example.com", "acct-b"),
+            "access-b".to_string(),
+            "refresh-b".to_string(),
+            Some("acct-b".to_string()),
+            Some(new_refresh),
+        );
+        switch_to_account(&other_workspace).expect("write other workspace auth");
+
+        assert!(!sync_active_account_from_current_auth().expect("check current auth"));
+
+        let unchanged = get_account(&stored.id)
+            .expect("load account")
+            .expect("account should exist");
+        assert!(matches!(
+            unchanged.auth_data,
+            AuthData::ChatGPT { refresh_token, .. } if refresh_token == "refresh-a"
+        ));
+    }
+
+    #[test]
+    fn stale_current_auth_does_not_replace_newer_stored_credentials() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let first_refresh = timestamp("2026-07-20T00:00:00Z");
+        let current_refresh = timestamp("2026-07-21T00:00:00Z");
+        let stored_refresh = timestamp("2026-07-22T00:00:00Z");
+        let stored = add_account(StoredAccount::new_chatgpt_with_last_refresh(
+            "ChatGPT".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-first".to_string(),
+            "refresh-first".to_string(),
+            Some("acct-one".to_string()),
+            Some(first_refresh),
+        ))
+        .expect("add account");
+        let current = StoredAccount::new_chatgpt_with_last_refresh(
+            "Current Codex".to_string(),
+            Some("user@example.com".to_string()),
+            Some("plus".to_string()),
+            id_token("user@example.com", "acct-one"),
+            "access-current".to_string(),
+            "refresh-current".to_string(),
+            Some("acct-one".to_string()),
+            Some(current_refresh),
+        );
+        switch_to_account(&current).expect("write current auth");
+        update_account_chatgpt_tokens_with_last_refresh(
+            &stored.id,
+            None,
+            id_token("user@example.com", "acct-one"),
+            "access-stored".to_string(),
+            "refresh-stored".to_string(),
+            Some("acct-one".to_string()),
+            Some("user@example.com".to_string()),
+            Some("pro".to_string()),
+            Some(stored_refresh),
+            false,
+        )
+        .expect("store newer credentials");
+
+        assert!(!sync_active_account_from_current_auth().expect("sync stale current auth"));
+
+        let unchanged = get_account(&stored.id)
+            .expect("load account")
+            .expect("account should exist");
+        assert!(matches!(
+            unchanged.auth_data,
+            AuthData::ChatGPT {
+                refresh_token,
+                last_refresh: Some(actual_refresh),
+                ..
+            } if refresh_token == "refresh-stored" && actual_refresh == stored_refresh
+        ));
+    }
+
+    #[test]
+    fn stale_refresh_response_does_not_overwrite_rotated_credentials() {
+        let _guard = crate::test_support::env_lock();
+        let _env = TestEnv::new();
+        let stored = add_account(chatgpt_account("ChatGPT", "old")).expect("add account");
+        update_account_chatgpt_tokens(
+            &stored.id,
+            "id-newer".to_string(),
+            "access-newer".to_string(),
+            "refresh-newer".to_string(),
+            Some("acct-newer".to_string()),
+            None,
+            None,
+        )
+        .expect("store rotated credentials");
+
+        let result = update_account_chatgpt_tokens_after_refresh(
+            &stored.id,
+            "refresh-old",
+            "id-stale".to_string(),
+            "access-stale".to_string(),
+            "refresh-stale".to_string(),
+            Some("acct-stale".to_string()),
+            None,
+            None,
+            false,
+        )
+        .expect("discard stale refresh response");
+
+        assert!(matches!(
+            result.auth_data,
+            AuthData::ChatGPT {
+                access_token,
+                refresh_token,
+                ..
+            } if access_token == "access-newer" && refresh_token == "refresh-newer"
+        ));
     }
 
     #[test]

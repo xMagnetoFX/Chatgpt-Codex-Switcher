@@ -70,7 +70,7 @@ impl StoredAccount {
         }
     }
 
-    /// Create a new account with ChatGPT OAuth authentication
+    /// Create a new account with freshly obtained ChatGPT OAuth credentials.
     pub fn new_chatgpt(
         name: String,
         email: Option<String>,
@@ -79,6 +79,29 @@ impl StoredAccount {
         access_token: String,
         refresh_token: String,
         account_id: Option<String>,
+    ) -> Self {
+        Self::new_chatgpt_with_last_refresh(
+            name,
+            email,
+            plan_type,
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            Some(Utc::now()),
+        )
+    }
+
+    /// Create a ChatGPT account while preserving the credential refresh time.
+    pub fn new_chatgpt_with_last_refresh(
+        name: String,
+        email: Option<String>,
+        plan_type: Option<String>,
+        id_token: String,
+        access_token: String,
+        refresh_token: String,
+        account_id: Option<String>,
+        last_refresh: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -91,6 +114,7 @@ impl StoredAccount {
                 access_token,
                 refresh_token,
                 account_id,
+                last_refresh,
             },
             created_at: Utc::now(),
             last_used_at: None,
@@ -128,6 +152,9 @@ pub enum AuthData {
         refresh_token: String,
         /// ChatGPT account ID
         account_id: Option<String>,
+        /// When these credentials were obtained or refreshed
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_refresh: Option<DateTime<Utc>>,
     },
 }
 
@@ -171,7 +198,10 @@ mod tests {
         assert_eq!(store.accounts[0].auth_mode, AuthMode::ChatGPT);
         assert!(matches!(
             store.accounts[0].auth_data,
-            AuthData::ChatGPT { .. }
+            AuthData::ChatGPT {
+                last_refresh: None,
+                ..
+            }
         ));
     }
 

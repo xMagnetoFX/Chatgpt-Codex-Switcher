@@ -5,7 +5,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use tempfile::NamedTempFile;
 
 use crate::types::{AuthData, AuthDotJson, StoredAccount, TokenData};
@@ -117,6 +116,7 @@ fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
             access_token,
             refresh_token,
             account_id,
+            last_refresh,
         } => Ok(AuthDotJson {
             openai_api_key: None,
             tokens: Some(TokenData {
@@ -125,7 +125,7 @@ fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
                 refresh_token: refresh_token.clone(),
                 account_id: account_id.clone(),
             }),
-            last_refresh: Some(Utc::now()),
+            last_refresh: *last_refresh,
         }),
     }
 }
@@ -146,15 +146,20 @@ pub fn import_from_auth_json_contents(
 ) -> Result<StoredAccount> {
     let auth: AuthDotJson =
         serde_json::from_str(content).context("Failed to parse auth.json contents")?;
+    let AuthDotJson {
+        openai_api_key,
+        tokens,
+        last_refresh,
+    } = auth;
 
     // Determine auth mode and create account
-    if let Some(api_key) = auth.openai_api_key {
+    if let Some(api_key) = openai_api_key {
         Ok(StoredAccount::new_api_key(account_name, api_key))
-    } else if let Some(tokens) = auth.tokens {
+    } else if let Some(tokens) = tokens {
         // Try to extract email and plan from id_token
         let (email, plan_type) = parse_id_token_claims(&tokens.id_token);
 
-        Ok(StoredAccount::new_chatgpt(
+        Ok(StoredAccount::new_chatgpt_with_last_refresh(
             account_name,
             email,
             plan_type,
@@ -162,6 +167,7 @@ pub fn import_from_auth_json_contents(
             tokens.access_token,
             tokens.refresh_token,
             tokens.account_id,
+            last_refresh,
         ))
     } else {
         anyhow::bail!("auth.json contains neither API key nor tokens");
@@ -169,34 +175,46 @@ pub fn import_from_auth_json_contents(
 }
 
 /// Parse claims from a JWT ID token (without validation)
-fn parse_id_token_claims(id_token: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_id_token_claims(id_token: &str) -> (Option<String>, Option<String>) {
+    let (email, plan_type, _) = parse_id_token_metadata(id_token);
+    (email, plan_type)
+}
+
+/// Parse the ChatGPT account identity embedded in a JWT ID token.
+pub(crate) fn parse_id_token_account_id(id_token: &str) -> Option<String> {
+    parse_id_token_metadata(id_token).2
+}
+
+fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
-        return (None, None);
+        return (None, None, None);
     }
 
     // Decode the payload (second part)
     let payload =
         match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, parts[1]) {
             Ok(bytes) => bytes,
-            Err(_) => return (None, None),
+            Err(_) => return (None, None, None),
         };
 
     let json: serde_json::Value = match serde_json::from_slice(&payload) {
         Ok(v) => v,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
 
     let email = json.get("email").and_then(|v| v.as_str()).map(String::from);
-
-    // Look for plan type in the OpenAI auth claims
-    let plan_type = json
-        .get("https://api.openai.com/auth")
+    let auth_claims = json.get("https://api.openai.com/auth");
+    let plan_type = auth_claims
         .and_then(|auth| auth.get("chatgpt_plan_type"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let account_id = auth_claims
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
-    (email, plan_type)
+    (email, plan_type, account_id)
 }
 
 /// Read the current auth.json file if it exists
