@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "1.2.3"
+version = "1.2.4"
 description = "A multi-account manager for Codex CLI"
 authors = ["lampese"]
 license = "GPL-3.0-only"
