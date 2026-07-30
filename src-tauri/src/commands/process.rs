@@ -1,6 +1,5 @@
 //! Process detection commands
 
-use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -466,12 +465,7 @@ fn is_codex_executable(executable: &str) -> bool {
         .trim_matches('"')
         .replace('\\', "/")
         .to_ascii_lowercase();
-    let file_name = Path::new(executable)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(executable)
-        .trim_matches('"')
-        .to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
 
     file_name == "codex"
         || file_name == "codex.exe"
