@@ -249,9 +249,11 @@ jobs:
                 ;;
             esac
 
-            destination="release-assets/$(basename "$package")"
+            source_name="$(basename "$package")"
+            release_name="${source_name// /.}"
+            destination="release-assets/$release_name"
             if [[ -e "$destination" ]]; then
-              echo "Duplicate release filename: $(basename "$package")" >&2
+              echo "Duplicate release filename: $release_name" >&2
               exit 1
             fi
 
