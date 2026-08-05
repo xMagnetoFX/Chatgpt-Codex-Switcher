@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Direction C · Command Bar Preferences</title>
+  <link rel="stylesheet" href="prototype-base.css" />
+  <style>
+    .command-shell { min-width: 0; min-height: 0; display: grid; grid-template-rows: 88px 42px 1fr 62px; }
+    .command-header { padding: 20px 30px 17px; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: flex-end; justify-content: space-between; }
+    .command-header h1 { margin: 0; font-size: 24px; font-weight: 620; letter-spacing: -.03em; }
+    .command-header p { margin: 5px 0 0; color: var(--muted); font-size: 11.5px; }
+    .scope-label { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .12em; }
+    .scope-value { margin-top: 5px; color: var(--text); font-family: "Cascadia Mono", monospace; font-size: 11px; }
+    .command-bar { display: flex; align-items: center; gap: 3px; padding: 0 22px; border-bottom: 1px solid var(--line); background: #1d1d1d; }
+    .command-tab { height: 31px; padding: 0 13px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 11.5px; }
+    .command-tab:hover { background: var(--surface-2); }
+    .command-tab.active { background: var(--surface-3); color: var(--text); }
+    .command-divider { width: 1px; height: 20px; background: var(--line); margin: 0 8px; }
+    .command-spacer { flex: 1; }
+    .command-badge { padding: 4px 8px; border-radius: 4px; color: var(--safe); background: rgba(108,203,95,.08); border: 1px solid rgba(108,203,95,.24); font-size: 10.5px; }
+    .preference-canvas { overflow: auto; padding: 24px 30px 30px; display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(310px, .88fr); gap: 18px; align-content: start; }
+    .groupbox { border: 1px solid var(--line); background: var(--surface); min-width: 0; }
+    .groupbox-title { height: 38px; padding: 0 14px; border-bottom: 1px solid var(--line); background: var(--surface-2); display: flex; align-items: center; justify-content: space-between; }
+    .groupbox-title h2 { margin: 0; font-size: 12.5px; font-weight: 650; }
+    .groupbox-title span { color: var(--faint); font-size: 10px; font-family: "Cascadia Mono", monospace; }
+    .control-row { min-height: 72px; padding: 12px 14px; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); }
+    .control-row:last-child { border-bottom: 0; }
+    .control-row:hover { background: var(--surface-2); }
+    .control-row strong { display: block; font-size: 12.5px; font-weight: 600; }
+    .control-row p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; max-width: 430px; }
+    .theme-options { display: grid; grid-template-columns: repeat(2, 54px); gap: 5px; }
+    .theme-options button { height: 29px; border: 1px solid var(--line-strong); border-radius: 4px; background: transparent; color: var(--muted); font-size: 10.5px; }
+    .theme-options button.active { color: var(--text); background: var(--surface-3); border-color: var(--accent-solid); }
+    .data-stack { display: grid; gap: 18px; }
+    .data-action { padding: 15px; border-bottom: 1px solid var(--line); }
+    .data-action:last-child { border-bottom: 0; }
+    .data-action strong { font-size: 12.5px; }
+    .data-action p { margin: 4px 0 13px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .data-buttons { display: flex; justify-content: flex-end; gap: 6px; }
+    .safety-footer { border-top: 1px solid var(--line); background: var(--surface-2); padding: 0 28px; display: grid; grid-template-columns: auto 1fr auto; gap: 13px; align-items: center; }
+    .safety-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid rgba(108,203,95,.28); background: rgba(108,203,95,.08); color: var(--safe); border-radius: 5px; font-weight: 700; }
+    .safety-footer strong { display: block; font-size: 11.5px; }
+    .safety-footer span { display: block; margin-top: 2px; color: var(--muted); font-size: 10.8px; }
+    .safety-count { font-family: "Cascadia Mono", monospace; color: var(--faint); font-size: 10.5px; }
+  </style>
+</head>
+<body>
+<!-- Assumption: the boldest native option is a compact command-bar utility with rectangular group boxes and a persistent safety footer. -->
+<div class="window">
+  <div class="titlebar"><span class="titlebar-name">ChatGPT Codex Switcher</span><div class="window-controls"><button class="window-control">−</button><button class="window-control">□</button><button class="window-control close">×</button></div></div>
+  <div class="app-body">
+    <aside class="global-sidebar">
+      <div class="brand"><img src="../../../public/app-logo.svg" alt="" /><div><strong>ChatGPT <span>Codex</span></strong><small>Switcher</small></div></div>
+      <div class="activity"><div><div class="activity-label">Codex activity</div><div class="activity-value">No active processes</div></div><i class="status-dot"></i></div>
+      <nav class="global-nav"><button><span class="nav-glyph">H</span><span><b>Home</b><small>Usage and switching</small></span></button><button class="active"><span class="nav-glyph">S</span><span><b>Settings</b><small>Workspace controls</small></span></button></nav>
+      <div class="add-account"><p>Sign in with OAuth or import an existing Codex auth.json file.</p><button class="primary-button">Add account</button></div>
+    </aside>
+    <section class="command-shell">
+      <header class="command-header"><div><h1>Workspace controls</h1><p>Preferences and account portability for this Windows device.</p></div><div><div class="scope-label">Configuration scope</div><div class="scope-value">LOCAL · THIS DEVICE</div></div></header>
+      <nav class="command-bar"><button class="command-tab active">Preferences</button><button class="command-tab">Transfer</button><button class="command-tab">Recovery</button><div class="command-divider"></div><button class="command-tab">Reset view</button><div class="command-spacer"></div><div class="command-badge">Process guard ready</div></nav>
+      <main class="preference-canvas">
+        <section class="groupbox"><header class="groupbox-title"><h2>Application preferences</h2><span>4 controls</span></header>
+          <div class="control-row"><div><strong>Protect account identities</strong><p>Mask account names, email addresses, and initials across the interface.</p></div><button class="switch" aria-label="Protect account identities"></button></div>
+          <div class="control-row"><div><strong>Application theme</strong><p>Choose the appearance used by the complete Switcher window.</p></div><div class="theme-options"><button>Light</button><button class="active">Dark</button></div></div>
+          <div class="control-row"><div><strong>Automatic warm-up</strong><p>Warm accounts after launch and every hour while Switcher is running.</p></div><button class="switch on" aria-label="Automatic warm-up"></button></div>
+          <div class="control-row"><div><strong>Restart Codex during switching</strong><p>Allow Switcher to close and reopen Codex when a safe switch requires it.</p></div><button class="switch on" aria-label="Restart Codex during switching"></button></div>
+        </section>
+        <div class="data-stack">
+          <section class="groupbox"><header class="groupbox-title"><h2>Slim transfer</h2><span>CLIPBOARD</span></header><div class="data-action"><strong>Compact account payload</strong><p>Merge only missing accounts, or copy the current compact payload for another Switcher.</p><div class="data-buttons"><button class="native-button">Import text</button><button class="native-button primary">Export text</button></div></div></section>
+          <section class="groupbox"><header class="groupbox-title"><h2>Encrypted recovery</h2><span>.CSWF FILE</span></header><div class="data-action"><strong>Complete local backup</strong><p>Restore or save every stored account using the protected desktop backup format.</p><div class="data-buttons"><button class="native-button">Restore file</button><button class="native-button primary">Create backup</button></div></div></section>
+        </div>
+      </main>
+      <footer class="safety-footer"><div class="safety-icon">✓</div><div><strong>Safe to switch and refresh</strong><span>No Codex processes are active. Restart switching will be used automatically when required.</span></div><div class="safety-count">0 FG · 0 BG</div></footer>
+    </section>
+  </div>
+</div>
+<div class="prototype-note">DIRECTION C · COMMAND BAR UTILITY</div>
+<script>document.querySelectorAll('.switch').forEach(x=>x.addEventListener('click',()=>x.classList.toggle('on')));document.querySelectorAll('.theme-options button').forEach(x=>x.addEventListener('click',()=>{x.parentElement.querySelectorAll('button').forEach(y=>y.classList.remove('active'));x.classList.add('active')}));</script>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Direction B · Property Inspector</title>
+  <link rel="stylesheet" href="prototype-base.css" />
+  <style>
+    .inspector-shell { min-width: 0; min-height: 0; display: grid; grid-template-rows: 92px 1fr 54px; }
+    .inspector-header { padding: 21px 28px 18px; border-bottom: 1px solid var(--line); background: var(--surface); display: flex; align-items: flex-end; justify-content: space-between; }
+    .inspector-header .eyebrow { color: var(--accent); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .14em; }
+    .inspector-header h1 { margin: 4px 0 0; font-size: 23px; letter-spacing: -.025em; font-weight: 620; }
+    .inspector-header p { margin: 5px 0 0; color: var(--muted); font-size: 11.5px; }
+    .header-state { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 11.5px; }
+    .header-state b { color: var(--safe); font-weight: 650; }
+    .inspector-main { min-height: 0; display: grid; grid-template-columns: 218px 1fr; }
+    .category-pane { padding: 18px 12px; border-right: 1px solid var(--line); background: #1d1d1d; }
+    .category-label { margin: 0 12px 8px; color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .category { width: 100%; height: 44px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); text-align: left; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; }
+    .category:hover { background: var(--surface-2); }
+    .category.active { background: var(--surface-3); color: var(--text); }
+    .category small { color: var(--faint); font-family: "Cascadia Mono", monospace; }
+    .detail-pane { min-width: 0; overflow: hidden; display: grid; grid-template-columns: 1fr 286px; }
+    .properties { overflow: auto; padding: 24px 22px; }
+    .properties h2 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
+    .properties > p { margin: 0 0 18px; color: var(--muted); font-size: 11.5px; }
+    .property-table { border-top: 1px solid var(--line); }
+    .property { min-height: 70px; display: grid; grid-template-columns: 164px minmax(0,1fr) auto; align-items: center; gap: 16px; border-bottom: 1px solid var(--line); }
+    .property-name { font-weight: 600; font-size: 12.5px; }
+    .property-description { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+    .select-control { height: 30px; min-width: 112px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface-3); color: var(--text); padding: 0 28px 0 10px; font-size: 11.5px; }
+    .tools-pane { border-left: 1px solid var(--line); background: var(--surface); padding: 22px 18px; overflow: auto; }
+    .tools-pane h2 { margin: 0; font-size: 15px; font-weight: 650; }
+    .tools-pane > p { margin: 5px 0 18px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .tool-section { border-top: 1px solid var(--line); padding: 16px 0 2px; }
+    .tool-section h3 { margin: 0 0 4px; font-size: 12px; }
+    .tool-section p { margin: 0 0 12px; color: var(--muted); font-size: 10.8px; line-height: 1.4; }
+    .tool-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .tool-buttons .native-button { width: 100%; padding: 0 8px; }
+    .inspector-footer { border-top: 1px solid var(--line); background: #1d1d1d; padding: 0 22px; display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
+    .footer-status { display: flex; align-items: center; gap: 9px; }
+    .footer-meta { font-family: "Cascadia Mono", monospace; font-size: 10px; color: var(--faint); }
+  </style>
+</head>
+<body>
+<!-- Assumption: a utility-app audience benefits from a dense property inspector and persistent action pane. -->
+<div class="window">
+  <div class="titlebar"><span class="titlebar-name">ChatGPT Codex Switcher</span><div class="window-controls"><button class="window-control">−</button><button class="window-control">□</button><button class="window-control close">×</button></div></div>
+  <div class="app-body">
+    <aside class="global-sidebar">
+      <div class="brand"><img src="../../../public/app-logo.svg" alt="" /><div><strong>ChatGPT <span>Codex</span></strong><small>Switcher</small></div></div>
+      <div class="activity"><div><div class="activity-label">Codex activity</div><div class="activity-value">No active processes</div></div><i class="status-dot"></i></div>
+      <nav class="global-nav"><button><span class="nav-glyph">H</span><span><b>Home</b><small>Usage and switching</small></span></button><button class="active"><span class="nav-glyph">S</span><span><b>Settings</b><small>Workspace controls</small></span></button></nav>
+      <div class="add-account"><p>Sign in with OAuth or import an existing Codex auth.json file.</p><button class="primary-button">Add account</button></div>
+    </aside>
+    <section class="inspector-shell">
+      <header class="inspector-header"><div><div class="eyebrow">Settings</div><h1>Workspace properties</h1><p>Configure the local Switcher environment without changing account credentials.</p></div><div class="header-state"><i class="status-dot"></i><span>Process guard <b>ready</b></span></div></header>
+      <div class="inspector-main">
+        <nav class="category-pane"><div class="category-label">Configuration</div><button class="category active"><span>Workspace</span><small>04</small></button><button class="category"><span>Automation</span><small>02</small></button><button class="category"><span>Privacy</span><small>01</small></button><div class="category-label" style="margin-top:22px">Data tools</div><button class="category"><span>Transfer</span><small>02</small></button><button class="category"><span>Backups</span><small>02</small></button></nav>
+        <section class="detail-pane">
+          <main class="properties"><h2>Workspace behavior</h2><p>Settings are stored locally and apply immediately.</p><div class="property-table">
+            <div class="property"><div class="property-name">Account identities</div><div class="property-description">Show names, emails, and initials throughout the workspace.</div><button class="switch on" aria-label="Account identities"></button></div>
+            <div class="property"><div class="property-name">Color mode</div><div class="property-description">Set the visual theme for the Switcher window.</div><select class="select-control"><option>Dark</option><option>Light</option></select></div>
+            <div class="property"><div class="property-name">Automatic warm-up</div><div class="property-description">Run after launch and hourly while the application is open.</div><button class="switch on" aria-label="Automatic warm-up"></button></div>
+            <div class="property"><div class="property-name">Restart on switch</div><div class="property-description">Restart Codex automatically when a safe account switch requires it.</div><button class="switch on" aria-label="Restart on switch"></button></div>
+          </div></main>
+          <aside class="tools-pane"><h2>Account data</h2><p>Transfer missing accounts or keep a complete encrypted recovery file.</p>
+            <section class="tool-section"><h3>Slim text</h3><p>Compact clipboard payload for merging accounts into another Switcher.</p><div class="tool-buttons"><button class="native-button">Import</button><button class="native-button">Export</button></div></section>
+            <section class="tool-section"><h3>Encrypted backup</h3><p>Complete local account store saved as a protected `.cswf` file.</p><div class="tool-buttons"><button class="native-button">Restore</button><button class="native-button primary">Back up</button></div></section>
+          </aside>
+        </section>
+      </div>
+      <footer class="inspector-footer"><div class="footer-status"><i class="status-dot"></i><span><span class="process-state">Safe to switch.</span> No Codex processes are active.</span></div><div class="footer-meta">0 foreground · 0 background</div></footer>
+    </section>
+  </div>
+</div>
+<div class="prototype-note">DIRECTION B · PROPERTY INSPECTOR</div>
+<script>document.querySelectorAll('.switch').forEach(x=>x.addEventListener('click',()=>x.classList.toggle('on')));</script>
+</body>
+</html>
