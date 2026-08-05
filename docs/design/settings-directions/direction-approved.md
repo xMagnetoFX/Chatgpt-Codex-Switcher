@@ -20,7 +20,8 @@ Follow-up authorization:
 - Remove the secondary Settings category rail completely.
 - Keep the existing global application sidebar as the only navigation rail.
 - Present every Settings option on one continuous page.
-- Preserve all four preferences, all four transfer and backup actions, and process-safety status.
+- Preserve all four preferences and all four transfer and backup actions.
+- Keep process status in the application sidebar instead of duplicating it in Settings.
 - Preserve existing callbacks, persistence, loading states, and accessibility names.
 - Do not change Home or other application surfaces.
 
@@ -28,4 +29,11 @@ Follow-up authorization:
 
 - Production rendering: `implemented-single-page.png`
 - The existing application sidebar is the only navigation rail.
-- All preferences, transfer actions, backup actions, and process status remain visible on one page.
+- All preferences, transfer actions, and backup actions remain visible on one page.
+
+## Follow-up refinement
+
+> "have similar thing at left pannel no need of it..also texts in settings really feels small"
+
+- Remove the duplicate Process safety strip from Settings.
+- Increase the Settings type and control scale while keeping the approved one-page structure.

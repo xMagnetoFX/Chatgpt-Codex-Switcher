@@ -1,5 +1,4 @@
 import type { ReactNode } from "react";
-import type { CodexProcessInfo } from "../types";
 import type { ThemeMode } from "../types/ui";
 
 interface SettingsViewProps {
@@ -7,14 +6,11 @@ interface SettingsViewProps {
   autoWarmupEnabled: boolean;
   restartSwitchEnabled: boolean;
   themeMode: ThemeMode;
-  isRefreshing: boolean;
   isAutoWarmupRunning: boolean;
   isExportingSlim: boolean;
   isImportingSlim: boolean;
   isExportingFull: boolean;
   isImportingFull: boolean;
-  processInfo: CodexProcessInfo | null;
-  hasRunningProcesses: boolean;
   onImportFullFile: () => void;
   onExportSlimText: () => void;
   onImportSlimText: () => void;
@@ -30,14 +26,11 @@ export function SettingsView({
   autoWarmupEnabled,
   restartSwitchEnabled,
   themeMode,
-  isRefreshing,
   isAutoWarmupRunning,
   isExportingSlim,
   isImportingSlim,
   isExportingFull,
   isImportingFull,
-  processInfo,
-  hasRunningProcesses,
   onImportFullFile,
   onExportSlimText,
   onImportSlimText,
@@ -177,13 +170,6 @@ export function SettingsView({
           }
         />
       </SettingsGroup>
-
-      <ProcessSafetyStatus
-        processInfo={processInfo}
-        hasRunningProcesses={hasRunningProcesses}
-        restartSwitchEnabled={restartSwitchEnabled}
-        isRefreshing={isRefreshing}
-      />
     </div>
   );
 }
@@ -294,40 +280,5 @@ function SettingsButton({
     >
       {label}
     </button>
-  );
-}
-
-function ProcessSafetyStatus({
-  processInfo,
-  hasRunningProcesses,
-  restartSwitchEnabled,
-  isRefreshing,
-}: {
-  processInfo: CodexProcessInfo | null;
-  hasRunningProcesses: boolean;
-  restartSwitchEnabled: boolean;
-  isRefreshing: boolean;
-}) {
-  const message = processInfo
-    ? hasRunningProcesses
-      ? restartSwitchEnabled
-        ? `Switching will restart ${processInfo.count} Codex ${processInfo.count === 1 ? "process" : "processes"}.`
-        : `Switching is locked until ${processInfo.count} Codex ${processInfo.count === 1 ? "process closes" : "processes close"}.`
-      : isRefreshing
-        ? "No Codex processes are active, and refreshes are safe to run right now."
-        : "No Codex processes are active. Switching and refreshes are allowed."
-    : "Process status is still loading.";
-
-  return (
-    <aside className={`settings-native-process ${hasRunningProcesses ? "busy" : ""}`}>
-      <div>
-        <strong>Process safety</strong>
-        <span>{message}</span>
-      </div>
-      <div className="settings-native-process-state">
-        <i />
-        {processInfo ? `${processInfo.background_count} background` : "Checking"}
-      </div>
-    </aside>
   );
 }

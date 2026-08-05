@@ -687,14 +687,11 @@ function App() {
             autoWarmupEnabled={autoWarmupEnabled}
             restartSwitchEnabled={restartSwitchEnabled}
             themeMode={themeMode}
-            isRefreshing={isRefreshing}
             isAutoWarmupRunning={isWarmingAll}
             isExportingSlim={isExportingSlim}
             isImportingSlim={isImportingSlim}
             isExportingFull={isExportingFull}
             isImportingFull={isImportingFull}
-            processInfo={processInfo}
-            hasRunningProcesses={hasRunningProcesses}
             onImportFullFile={() => {
               void handleImportFullFile();
             }}
