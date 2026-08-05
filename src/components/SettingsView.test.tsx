@@ -81,4 +81,36 @@ describe("SettingsView", () => {
     expect(props.onToggleAutoWarmup).toHaveBeenCalledTimes(1);
     expect(props.onToggleRestartSwitch).toHaveBeenCalledTimes(1);
   });
+
+  it("presents every setting on one page without a secondary category rail", () => {
+    renderSettings();
+
+    expect(screen.getByRole("heading", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Account transfer" })).toBeInTheDocument();
+    expect(screen.getByText("Process safety")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "General" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Automation" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Privacy" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Transfer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Backups" })).not.toBeInTheDocument();
+  });
+
+  it("reports busy process safety without changing the available controls", () => {
+    renderSettings({
+      processInfo: {
+        count: 2,
+        background_count: 1,
+        can_switch: false,
+        pids: [101, 202],
+      },
+      hasRunningProcesses: true,
+      restartSwitchEnabled: false,
+    });
+
+    expect(
+      screen.getByText("Switching is locked until 2 Codex processes close.")
+    ).toBeInTheDocument();
+    expect(screen.getByText("1 background")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Restart switching disabled/i })).toBeInTheDocument();
+  });
 });

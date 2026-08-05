@@ -1,17 +1,6 @@
+import type { ReactNode } from "react";
 import type { CodexProcessInfo } from "../types";
 import type { ThemeMode } from "../types/ui";
-import {
-  ArchiveDownIcon,
-  ArchiveUpIcon,
-  BoltIcon,
-  EyeIcon,
-  EyeOffIcon,
-  RefreshIcon,
-  ShieldIcon,
-  SunIcon,
-  MoonIcon,
-} from "./icons";
-import { SettingsAction, SettingsPanel, StatusChip } from "./ui";
 
 interface SettingsViewProps {
   allMasked: boolean;
@@ -59,139 +48,286 @@ export function SettingsView({
   onToggleTheme,
 }: SettingsViewProps) {
   return (
-    <div className="settings-grid">
-      <SettingsPanel
-        title="Slim transfer"
-        description="Share or restore the compact text payload for missing accounts."
+    <div className="settings-native-page">
+      <SettingsGroup
+        title="Workspace"
+        description="Privacy, appearance, automation, and account switching behavior."
       >
-        <SettingsAction
-          title={isExportingSlim ? "Exporting slim text…" : "Export slim text"}
-          description="Copy a compact account payload to your clipboard."
-          icon={<ArchiveUpIcon className="h-5 w-5" />}
-          onClick={onExportSlimText}
-          disabled={isExportingSlim}
+        <PreferenceRow
+          title="Account identities"
+          description={
+            allMasked
+              ? "Names, emails, and initials are hidden across the app."
+              : "Names, emails, and initials are visible across the app."
+          }
+          control={
+            <NativeSwitch
+              active={allMasked}
+              label={allMasked ? "Reveal all accounts" : "Hide all accounts"}
+              onClick={onToggleMaskAll}
+            />
+          }
         />
-        <SettingsAction
-          title={isImportingSlim ? "Importing slim text…" : "Import slim text"}
-          description="Merge in any accounts you do not already have."
-          icon={<ArchiveDownIcon className="h-5 w-5" />}
-          onClick={onImportSlimText}
-          disabled={isImportingSlim}
+        <PreferenceRow
+          title="Appearance"
+          description="Choose the color mode used throughout the Switcher."
+          control={
+            <div className="settings-segmented-control" role="group" aria-label="Appearance">
+              <button
+                type="button"
+                aria-label="Switch to light mode"
+                aria-pressed={themeMode === "light"}
+                className={themeMode === "light" ? "selected" : ""}
+                onClick={() => {
+                  if (themeMode !== "light") onToggleTheme();
+                }}
+              >
+                Light
+              </button>
+              <button
+                type="button"
+                aria-label="Switch to dark mode"
+                aria-pressed={themeMode === "dark"}
+                className={themeMode === "dark" ? "selected" : ""}
+                onClick={() => {
+                  if (themeMode !== "dark") onToggleTheme();
+                }}
+              >
+                Dark
+              </button>
+            </div>
+          }
         />
-      </SettingsPanel>
+        <PreferenceRow
+          title="Automatic warm-up"
+          description={
+            isAutoWarmupRunning
+              ? "A warm-up cycle is running now."
+              : autoWarmupEnabled
+                ? "Runs after launch and hourly while the app remains open."
+                : "No background warm-up traffic will be sent."
+          }
+          control={
+            <NativeSwitch
+              active={autoWarmupEnabled}
+              busy={isAutoWarmupRunning}
+              label={autoWarmupEnabled ? "Auto warm-up enabled" : "Auto warm-up disabled"}
+              onClick={onToggleAutoWarmup}
+            />
+          }
+        />
+        <PreferenceRow
+          title="Restart Codex when switching"
+          description={
+            restartSwitchEnabled
+              ? "Close and reopen Codex automatically when a safe account switch requires it."
+              : "Account switching remains locked until Codex is closed."
+          }
+          control={
+            <NativeSwitch
+              active={restartSwitchEnabled}
+              label={
+                restartSwitchEnabled ? "Restart switching enabled" : "Restart switching disabled"
+              }
+              onClick={onToggleRestartSwitch}
+            />
+          }
+        />
+      </SettingsGroup>
 
-      <SettingsPanel
-        title="Backups"
-        description="Create or restore the full encrypted backup file used by the desktop app."
+      <SettingsGroup
+        title="Account transfer"
+        description="Move missing accounts or keep an encrypted recovery copy of the complete store."
       >
-        <SettingsAction
-          title={isExportingFull ? "Exporting full backup…" : "Export full backup"}
-          description="Save every stored account to a `.cswf` file."
-          icon={<ShieldIcon className="h-5 w-5" />}
-          onClick={onExportFullFile}
-          disabled={isExportingFull}
+        <TransferRow
+          title="Slim text transfer"
+          description="Copy or merge a compact clipboard payload containing missing accounts."
+          actions={
+            <>
+              <SettingsButton
+                label={isImportingSlim ? "Importing slim text…" : "Import slim text"}
+                onClick={onImportSlimText}
+                disabled={isImportingSlim}
+              />
+              <SettingsButton
+                label={isExportingSlim ? "Exporting slim text…" : "Export slim text"}
+                onClick={onExportSlimText}
+                disabled={isExportingSlim}
+              />
+            </>
+          }
         />
-        <SettingsAction
-          title={isImportingFull ? "Importing full backup…" : "Restore full backup"}
-          description="Rehydrate the local account store from backup."
-          icon={<ShieldIcon className="h-5 w-5" />}
-          onClick={onImportFullFile}
-          disabled={isImportingFull}
+        <TransferRow
+          title="Encrypted backup"
+          description="Restore or save every stored account using the protected `.cswf` desktop format."
+          actions={
+            <>
+              <SettingsButton
+                label={isImportingFull ? "Restoring full backup…" : "Restore full backup"}
+                onClick={onImportFullFile}
+                disabled={isImportingFull}
+              />
+              <SettingsButton
+                label={isExportingFull ? "Exporting full backup…" : "Export full backup"}
+                onClick={onExportFullFile}
+                disabled={isExportingFull}
+                primary
+              />
+            </>
+          }
         />
-      </SettingsPanel>
+      </SettingsGroup>
 
-      <SettingsPanel
-        title="Workspace preferences"
-        description="Privacy, appearance, automation, and process safety in one compact control strip."
-        className="settings-panel-span-all"
-      >
-        <div className="settings-preference-grid">
-          <SettingsAction
-            title={allMasked ? "Reveal all accounts" : "Hide all accounts"}
-            description={
-              allMasked
-                ? "Show names, emails, and initials again."
-                : "Mask names, emails, and initials across the app."
-            }
-            icon={allMasked ? <EyeOffIcon className="h-5 w-5" /> : <EyeIcon className="h-5 w-5" />}
-            onClick={onToggleMaskAll}
-            trailing={<PreferenceBadge active={allMasked}>{allMasked ? "Hidden" : "Shown"}</PreferenceBadge>}
-            showChevron={false}
-          />
-          <SettingsAction
-            title={themeMode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-            description="Flip between the two built-in visual themes."
-            icon={themeMode === "dark" ? <SunIcon className="h-5 w-5" /> : <MoonIcon className="h-5 w-5" />}
-            onClick={onToggleTheme}
-            trailing={
-              <PreferenceBadge active={themeMode === "dark"}>
-                {themeMode === "dark" ? "Dark" : "Light"}
-              </PreferenceBadge>
-            }
-            showChevron={false}
-          />
-          <SettingsAction
-            title={autoWarmupEnabled ? "Auto warm-up enabled" : "Auto warm-up disabled"}
-            description={
-              isAutoWarmupRunning
-                ? "A warm-up cycle is running now."
-                : autoWarmupEnabled
-                  ? "Runs after launch and hourly while open."
-                  : "Off means no background warm-up traffic."
-            }
-            icon={<BoltIcon className={`h-5 w-5 ${isAutoWarmupRunning ? "animate-pulse" : ""}`} />}
-            onClick={onToggleAutoWarmup}
-            trailing={
-              <PreferenceBadge active={autoWarmupEnabled}>
-                {isAutoWarmupRunning ? "Running" : autoWarmupEnabled ? "On" : "Off"}
-              </PreferenceBadge>
-            }
-            showChevron={false}
-          />
-          <SettingsAction
-            title={restartSwitchEnabled ? "Restart switching enabled" : "Restart switching disabled"}
-            description={
-              restartSwitchEnabled
-                ? "Switching can close and reopen Codex when needed."
-                : "Switching stays locked until Codex is closed."
-            }
-            icon={<RefreshIcon className="h-5 w-5" />}
-            onClick={onToggleRestartSwitch}
-            trailing={
-              <PreferenceBadge active={restartSwitchEnabled}>
-                {restartSwitchEnabled ? "On" : "Off"}
-              </PreferenceBadge>
-            }
-            showChevron={false}
-          />
-        </div>
-
-        <div className="process-banner">
-          <div>
-            <div className="kicker-faint">Process safety</div>
-            <p>
-              {processInfo
-                ? hasRunningProcesses
-                  ? restartSwitchEnabled
-                    ? `Switching will restart ${processInfo.count} Codex ${processInfo.count === 1 ? "process" : "processes"}.`
-                    : `Switching is locked until ${processInfo.count} Codex ${processInfo.count === 1 ? "process closes" : "processes close"}.`
-                  : isRefreshing
-                    ? "No Codex processes are active, and refreshes are safe to run right now."
-                    : "No Codex processes are active, so switching and refreshes are allowed."
-                : "Process status is still loading."}
-            </p>
-          </div>
-          <StatusChip busy={hasRunningProcesses}>
-            {processInfo ? `${processInfo.background_count} background` : "Checking"}
-          </StatusChip>
-        </div>
-      </SettingsPanel>
+      <ProcessSafetyStatus
+        processInfo={processInfo}
+        hasRunningProcesses={hasRunningProcesses}
+        restartSwitchEnabled={restartSwitchEnabled}
+        isRefreshing={isRefreshing}
+      />
     </div>
   );
 }
 
-function PreferenceBadge({ active, children }: { active: boolean; children: string }) {
+function SettingsGroup({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description: string;
+  children: ReactNode;
+}) {
+  const headingId = `settings-${title.toLowerCase().replace(/\s+/g, "-")}`;
+
   return (
-    <span className={`pref-badge ${active ? "on" : ""}`}>{children}</span>
+    <section className="settings-native-group" aria-labelledby={headingId}>
+      <div className="settings-native-group-heading">
+        <h3 id={headingId}>{title}</h3>
+        <p>{description}</p>
+      </div>
+      <div className="settings-native-list">{children}</div>
+    </section>
+  );
+}
+
+function PreferenceRow({
+  title,
+  description,
+  control,
+}: {
+  title: string;
+  description: string;
+  control: ReactNode;
+}) {
+  return (
+    <div className="settings-native-row">
+      <div className="settings-native-row-copy">
+        <strong>{title}</strong>
+        <span>{description}</span>
+      </div>
+      <div className="settings-native-row-control">{control}</div>
+    </div>
+  );
+}
+
+function TransferRow({
+  title,
+  description,
+  actions,
+}: {
+  title: string;
+  description: string;
+  actions: ReactNode;
+}) {
+  return (
+    <div className="settings-native-row settings-native-transfer-row">
+      <div className="settings-native-row-copy">
+        <strong>{title}</strong>
+        <span>{description}</span>
+      </div>
+      <div className="settings-native-actions">{actions}</div>
+    </div>
+  );
+}
+
+function NativeSwitch({
+  active,
+  busy = false,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  busy?: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`settings-native-switch ${active ? "on" : ""} ${busy ? "busy" : ""}`}
+      aria-label={label}
+      aria-pressed={active}
+      onClick={onClick}
+    >
+      <span />
+    </button>
+  );
+}
+
+function SettingsButton({
+  label,
+  onClick,
+  disabled,
+  primary = false,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled: boolean;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      className={`settings-native-button ${primary ? "primary" : ""}`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ProcessSafetyStatus({
+  processInfo,
+  hasRunningProcesses,
+  restartSwitchEnabled,
+  isRefreshing,
+}: {
+  processInfo: CodexProcessInfo | null;
+  hasRunningProcesses: boolean;
+  restartSwitchEnabled: boolean;
+  isRefreshing: boolean;
+}) {
+  const message = processInfo
+    ? hasRunningProcesses
+      ? restartSwitchEnabled
+        ? `Switching will restart ${processInfo.count} Codex ${processInfo.count === 1 ? "process" : "processes"}.`
+        : `Switching is locked until ${processInfo.count} Codex ${processInfo.count === 1 ? "process closes" : "processes close"}.`
+      : isRefreshing
+        ? "No Codex processes are active, and refreshes are safe to run right now."
+        : "No Codex processes are active. Switching and refreshes are allowed."
+    : "Process status is still loading.";
+
+  return (
+    <aside className={`settings-native-process ${hasRunningProcesses ? "busy" : ""}`}>
+      <div>
+        <strong>Process safety</strong>
+        <span>{message}</span>
+      </div>
+      <div className="settings-native-process-state">
+        <i />
+        {processInfo ? `${processInfo.background_count} background` : "Checking"}
+      </div>
+    </aside>
   );
 }
