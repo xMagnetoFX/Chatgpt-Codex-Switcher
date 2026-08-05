@@ -16,7 +16,10 @@ use crate::types::{OAuthLoginInfo, StoredAccount};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_PORT: u16 = 1455; // Same as official Codex
+// These are the callback ports registered for the official Codex OAuth client.
+// Keep this list aligned with Codex CLI. Arbitrary ports are rejected by the
+// authorization server even when a local listener can bind successfully.
+const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 
 /// PKCE codes for OAuth
 #[derive(Debug, Clone)]
@@ -59,11 +62,15 @@ fn build_authorize_url(
         ("response_type", "code"),
         ("client_id", client_id),
         ("redirect_uri", redirect_uri),
-        ("scope", "openid profile email offline_access"),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        ),
         ("code_challenge", &pkce.code_challenge),
         ("code_challenge_method", "S256"),
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
+        ("prompt", "login"),
         ("state", state),
         ("originator", "codex_cli_rs"), // Required by OpenAI OAuth
     ];
@@ -75,6 +82,27 @@ fn build_authorize_url(
         .join("&");
 
     format!("{issuer}/oauth/authorize?{query_string}")
+}
+
+fn bind_callback_server(ports: &[u16]) -> Result<Server> {
+    let mut failures = Vec::with_capacity(ports.len());
+
+    for port in ports {
+        match Server::http(format!("127.0.0.1:{port}")) {
+            Ok(server) => return Ok(server),
+            Err(error) => failures.push(format!("{port}: {error}")),
+        }
+    }
+
+    let port_list = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    anyhow::bail!(
+        "OAuth callback ports {port_list} are unavailable. Stop the app or service using one of those ports, then try again. ({})",
+        failures.join("; ")
+    )
 }
 
 /// Token response from the OAuth server
@@ -174,20 +202,7 @@ pub async fn start_oauth_login(
     println!("[OAuth] Starting login for account: {account_name}");
     println!("[OAuth] PKCE challenge: {}", &pkce.code_challenge[..20]);
 
-    // Try official default port first; fall back to a random free port if it is busy.
-    let server = match Server::http(format!("127.0.0.1:{DEFAULT_PORT}")) {
-        Ok(server) => server,
-        Err(default_err) => {
-            println!(
-                "[OAuth] Default callback port {DEFAULT_PORT} unavailable ({default_err}), using a random local port"
-            );
-            Server::http("127.0.0.1:0").map_err(|fallback_err| {
-                anyhow::anyhow!(
-                    "Failed to start OAuth server: default port {DEFAULT_PORT} error: {default_err}; fallback error: {fallback_err}"
-                )
-            })?
-        }
-    };
+    let server = bind_callback_server(&CALLBACK_PORTS)?;
 
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
@@ -435,4 +450,123 @@ pub async fn wait_for_oauth_login(
 ) -> Result<StoredAccount> {
     let result = rx.await.context("OAuth login was cancelled")??;
     Ok(result.account)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::TcpListener;
+
+    #[test]
+    fn authorization_url_matches_the_current_codex_login_contract() {
+        let pkce = PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+
+        let raw_url = build_authorize_url(
+            DEFAULT_ISSUER,
+            CLIENT_ID,
+            "http://localhost:1457/auth/callback",
+            &pkce,
+            "state",
+        );
+        let url = url::Url::parse(&raw_url).expect("authorization URL should parse");
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            url.as_str().split('?').next(),
+            Some("https://auth.openai.com/oauth/authorize")
+        );
+        assert_eq!(params.get("client_id").map(String::as_str), Some(CLIENT_ID));
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://localhost:1457/auth/callback")
+        );
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some("openid profile email offline_access api.connectors.read api.connectors.invoke")
+        );
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("challenge")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("id_token_add_organizations").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            params.get("codex_cli_simplified_flow").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(params.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(params.get("state").map(String::as_str), Some("state"));
+        assert_eq!(
+            params.get("originator").map(String::as_str),
+            Some("codex_cli_rs")
+        );
+    }
+
+    #[test]
+    fn callback_server_uses_the_next_registered_port_when_the_first_is_busy() {
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve first callback port");
+        let occupied_port = occupied
+            .local_addr()
+            .expect("first callback address")
+            .port();
+        let available = TcpListener::bind("127.0.0.1:0").expect("find second callback port");
+        let available_port = available
+            .local_addr()
+            .expect("second callback address")
+            .port();
+        drop(available);
+
+        let server = bind_callback_server(&[occupied_port, available_port])
+            .expect("second callback port should be used");
+
+        assert_eq!(
+            server.server_addr().to_ip().map(|address| address.port()),
+            Some(available_port)
+        );
+    }
+
+    #[test]
+    fn production_callback_ports_are_registered_codex_ports() {
+        assert_eq!(CALLBACK_PORTS, [1455, 1457]);
+    }
+
+    #[tokio::test]
+    #[ignore = "uses the registered localhost OAuth callback ports"]
+    async fn login_flow_uses_registered_fallback_when_default_port_is_busy() {
+        // Terra and another Codex login service may already own 1455. If not,
+        // reserve it here so this test always exercises the 1457 fallback.
+        let _default_port_reservation = TcpListener::bind("127.0.0.1:1455").ok();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (info, receiver) = start_oauth_login("Test account".to_string(), cancelled.clone())
+            .await
+            .expect("OAuth login should use the registered fallback port");
+
+        assert_eq!(info.callback_port, 1457);
+        let url = url::Url::parse(&info.auth_url).expect("authorization URL should parse");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .map(|(_, value)| value.into_owned()),
+            Some("http://localhost:1457/auth/callback".to_string())
+        );
+
+        cancelled.store(true, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(2), wait_for_oauth_login(receiver))
+            .await
+            .expect("cancelled login server should stop promptly");
+        assert!(
+            result.is_err(),
+            "cancelled login should not produce an account"
+        );
+    }
 }
