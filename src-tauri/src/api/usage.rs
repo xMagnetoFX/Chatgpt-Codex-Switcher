@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::auth::{
-    ensure_chatgpt_tokens_fresh, refresh_chatgpt_tokens, resolved_chatgpt_account_id,
+    ensure_chatgpt_tokens_fresh, parse_id_token_subscription_active_until, refresh_chatgpt_tokens,
+    resolved_chatgpt_account_id,
 };
 use crate::types::{
     AuthData, CreditStatusDetails, RateLimitDetails, RateLimitStatusPayload, RateLimitWindow,
@@ -103,11 +104,34 @@ pub async fn get_chatgpt_account_metadata(
     account: &StoredAccount,
 ) -> Result<ChatGptAccountMetadata> {
     let fresh_account = ensure_chatgpt_tokens_fresh(account).await?;
-    let (access_token, chatgpt_account_id) = extract_chatgpt_metadata_auth(&fresh_account)?;
+    let token_metadata = chatgpt_account_metadata_from_id_token(&fresh_account);
+
+    match fetch_chatgpt_account_metadata(&fresh_account).await {
+        Ok(mut metadata) => {
+            if metadata.plan_type.is_none() {
+                metadata.plan_type = token_metadata
+                    .as_ref()
+                    .and_then(|fallback| fallback.plan_type.clone());
+            }
+            if metadata.subscription_expires_at.is_none() {
+                metadata.subscription_expires_at = token_metadata
+                    .as_ref()
+                    .and_then(|fallback| fallback.subscription_expires_at);
+            }
+            Ok(metadata)
+        }
+        Err(error) => token_metadata.ok_or(error),
+    }
+}
+
+async fn fetch_chatgpt_account_metadata(
+    fresh_account: &StoredAccount,
+) -> Result<ChatGptAccountMetadata> {
+    let (access_token, chatgpt_account_id) = extract_chatgpt_metadata_auth(fresh_account)?;
 
     let response = send_chatgpt_account_metadata_request(access_token, &chatgpt_account_id).await?;
     if response.status() == StatusCode::UNAUTHORIZED {
-        let refreshed_account = refresh_chatgpt_tokens(&fresh_account).await?;
+        let refreshed_account = refresh_chatgpt_tokens(fresh_account).await?;
         let (retry_token, retry_account_id) = extract_chatgpt_metadata_auth(&refreshed_account)?;
         let retry_response =
             send_chatgpt_account_metadata_request(retry_token, &retry_account_id).await?;
@@ -115,6 +139,20 @@ pub async fn get_chatgpt_account_metadata(
     }
 
     parse_chatgpt_account_metadata_response(&chatgpt_account_id, response).await
+}
+
+fn chatgpt_account_metadata_from_id_token(
+    account: &StoredAccount,
+) -> Option<ChatGptAccountMetadata> {
+    let AuthData::ChatGPT { id_token, .. } = &account.auth_data else {
+        return None;
+    };
+    let subscription_expires_at = parse_id_token_subscription_active_until(id_token)?;
+
+    Some(ChatGptAccountMetadata {
+        plan_type: account.plan_type.clone(),
+        subscription_expires_at: Some(subscription_expires_at),
+    })
 }
 
 async fn parse_chatgpt_account_metadata_response(
@@ -576,10 +614,44 @@ pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_payload_to_usage_info, extract_chatgpt_account_metadata, get_account_usage,
-        AccountsCheckResponse,
+        chatgpt_account_metadata_from_id_token, convert_payload_to_usage_info,
+        extract_chatgpt_account_metadata, get_account_usage, AccountsCheckResponse,
     };
     use crate::types::{RateLimitStatusPayload, StoredAccount};
+    use base64::Engine as _;
+
+    #[test]
+    fn builds_subscription_metadata_from_the_id_token_claim() {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-target",
+                "chatgpt_plan_type": "plus",
+                "chatgpt_subscription_active_until": "2026-09-12T05:30:00Z"
+            }
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize subscription claim"));
+        let account = StoredAccount::new_chatgpt(
+            "Subscriber".to_string(),
+            None,
+            Some("plus".to_string()),
+            format!("header.{encoded}.signature"),
+            "access-token".to_string(),
+            "refresh-token".to_string(),
+            Some("acct-target".to_string()),
+        );
+
+        let metadata = chatgpt_account_metadata_from_id_token(&account)
+            .expect("subscription claim should provide fallback metadata");
+
+        assert_eq!(metadata.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            metadata
+                .subscription_expires_at
+                .map(|value| value.to_rfc3339()),
+            Some("2026-09-12T05:30:00+00:00".to_string())
+        );
+    }
 
     #[test]
     fn extracts_subscription_metadata_for_the_exact_requested_account() {

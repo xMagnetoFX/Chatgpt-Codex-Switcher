@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
 use super::atomic_file::{
     read_snapshot, recover_externally_mutable_file, restore_if_matches, stage_file_change,
@@ -551,13 +552,18 @@ fn import_from_auth_json_bytes(bytes: &[u8], account_name: String) -> Result<Sto
 
 /// Parse claims from a JWT ID token without validating its signature.
 pub(crate) fn parse_id_token_claims(id_token: &str) -> (Option<String>, Option<String>) {
-    let (email, plan_type, _) = parse_id_token_metadata(id_token);
-    (email, plan_type)
+    let metadata = parse_id_token_metadata(id_token);
+    (metadata.email, metadata.plan_type)
 }
 
 /// Parse the ChatGPT account identity embedded in a JWT ID token.
 pub(crate) fn parse_id_token_account_id(id_token: &str) -> Option<String> {
-    parse_id_token_metadata(id_token).2
+    parse_id_token_metadata(id_token).account_id
+}
+
+/// Parse the end of the current ChatGPT subscription entitlement from an ID token.
+pub(crate) fn parse_id_token_subscription_active_until(id_token: &str) -> Option<DateTime<Utc>> {
+    parse_id_token_metadata(id_token).subscription_active_until
 }
 
 pub(crate) fn resolved_chatgpt_account_id(
@@ -606,9 +612,17 @@ fn parse_jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&payload).ok()
 }
 
-fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, Option<String>) {
+#[derive(Default)]
+struct ChatGptIdTokenMetadata {
+    email: Option<String>,
+    plan_type: Option<String>,
+    account_id: Option<String>,
+    subscription_active_until: Option<DateTime<Utc>>,
+}
+
+fn parse_id_token_metadata(id_token: &str) -> ChatGptIdTokenMetadata {
     let Some(json) = parse_jwt_payload(id_token) else {
-        return (None, None, None);
+        return ChatGptIdTokenMetadata::default();
     };
 
     let email = json
@@ -624,8 +638,18 @@ fn parse_id_token_metadata(id_token: &str) -> (Option<String>, Option<String>, O
         .and_then(|auth| auth.get("chatgpt_account_id"))
         .and_then(|value| value.as_str())
         .map(String::from);
+    let subscription_active_until = auth_claims
+        .and_then(|auth| auth.get("chatgpt_subscription_active_until"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
 
-    (email, plan_type, account_id)
+    ChatGptIdTokenMetadata {
+        email,
+        plan_type,
+        account_id,
+        subscription_active_until,
+    }
 }
 
 /// Read and strictly validate the current auth.json file if it exists.
@@ -669,6 +693,25 @@ mod tests {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).expect("serialize expiry"));
         format!("header.{encoded}.signature")
+    }
+
+    #[test]
+    fn parses_subscription_active_until_without_using_token_expiry() {
+        let payload = serde_json::json!({
+            "exp": 1_900_000_000,
+            "https://api.openai.com/auth": {
+                "chatgpt_subscription_active_until": "2026-09-12T05:30:00Z"
+            }
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("serialize subscription claim"));
+        let token = format!("header.{encoded}.signature");
+
+        let active_until = parse_id_token_subscription_active_until(&token)
+            .expect("subscription claim should parse");
+
+        assert_eq!(active_until.to_rfc3339(), "2026-09-12T05:30:00+00:00");
+        assert_ne!(active_until.timestamp(), 1_900_000_000);
     }
 
     fn chatgpt_account(name: &str, account_id: Option<&str>) -> StoredAccount {
