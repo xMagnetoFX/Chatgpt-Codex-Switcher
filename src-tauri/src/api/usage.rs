@@ -1,23 +1,62 @@
 //! Usage API client for fetching rate limits and credits
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT},
     StatusCode,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
-use crate::auth::{ensure_chatgpt_tokens_fresh, refresh_chatgpt_tokens};
+use crate::auth::{
+    ensure_chatgpt_tokens_fresh, refresh_chatgpt_tokens, resolved_chatgpt_account_id,
+};
 use crate::types::{
     AuthData, CreditStatusDetails, RateLimitDetails, RateLimitStatusPayload, RateLimitWindow,
     StoredAccount, UsageInfo,
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
+const CHATGPT_ACCOUNTS_CHECK_API: &str =
+    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const CHATGPT_CODEX_RESPONSES_API: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_API: &str = "https://api.openai.com/v1";
 const CODEX_USER_AGENT: &str = "codex-cli/1.0.0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptAccountMetadata {
+    pub plan_type: Option<String>,
+    pub subscription_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsCheckResponse {
+    #[serde(default)]
+    accounts: HashMap<String, AccountsCheckEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsCheckEntry {
+    #[serde(default)]
+    account: Option<AccountsCheckAccount>,
+    #[serde(default)]
+    entitlement: Option<AccountsCheckEntitlement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsCheckAccount {
+    #[serde(default)]
+    plan_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsCheckEntitlement {
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+}
 
 /// Get usage information for an account
 pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
@@ -57,6 +96,62 @@ pub async fn warmup_account(account: &StoredAccount) -> Result<()> {
         AuthData::ApiKey { key } => warmup_with_api_key(key).await,
         AuthData::ChatGPT { .. } => warmup_with_chatgpt_auth(account).await,
     }
+}
+
+/// Fetch the current ChatGPT plan and entitlement period for one exact account.
+pub async fn get_chatgpt_account_metadata(
+    account: &StoredAccount,
+) -> Result<ChatGptAccountMetadata> {
+    let fresh_account = ensure_chatgpt_tokens_fresh(account).await?;
+    let (access_token, chatgpt_account_id) = extract_chatgpt_metadata_auth(&fresh_account)?;
+
+    let response = send_chatgpt_account_metadata_request(access_token, &chatgpt_account_id).await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let refreshed_account = refresh_chatgpt_tokens(&fresh_account).await?;
+        let (retry_token, retry_account_id) = extract_chatgpt_metadata_auth(&refreshed_account)?;
+        let retry_response =
+            send_chatgpt_account_metadata_request(retry_token, &retry_account_id).await?;
+        return parse_chatgpt_account_metadata_response(&retry_account_id, retry_response).await;
+    }
+
+    parse_chatgpt_account_metadata_response(&chatgpt_account_id, response).await
+}
+
+async fn parse_chatgpt_account_metadata_response(
+    chatgpt_account_id: &str,
+    response: reqwest::Response,
+) -> Result<ChatGptAccountMetadata> {
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("ChatGPT account metadata request failed with status {status}");
+    }
+
+    let payload: AccountsCheckResponse = response
+        .json()
+        .await
+        .context("Failed to parse ChatGPT account metadata response")?;
+    extract_chatgpt_account_metadata(&payload, chatgpt_account_id)
+}
+
+fn extract_chatgpt_account_metadata(
+    payload: &AccountsCheckResponse,
+    chatgpt_account_id: &str,
+) -> Result<ChatGptAccountMetadata> {
+    let entry = payload
+        .accounts
+        .get(chatgpt_account_id)
+        .context("ChatGPT account metadata response did not include the requested account")?;
+
+    Ok(ChatGptAccountMetadata {
+        plan_type: entry
+            .account
+            .as_ref()
+            .and_then(|account| account.plan_type.clone()),
+        subscription_expires_at: entry
+            .entitlement
+            .as_ref()
+            .and_then(|entitlement| entitlement.expires_at),
+    })
 }
 
 async fn get_usage_with_chatgpt_auth(account: &StoredAccount) -> Result<UsageInfo> {
@@ -245,6 +340,22 @@ fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>)>
     }
 }
 
+fn extract_chatgpt_metadata_auth(account: &StoredAccount) -> Result<(&str, String)> {
+    match &account.auth_data {
+        AuthData::ChatGPT {
+            id_token,
+            access_token,
+            account_id,
+            ..
+        } => {
+            let account_id = resolved_chatgpt_account_id(account_id.as_deref(), id_token)?
+                .context("ChatGPT account metadata requires a stable account ID")?;
+            Ok((access_token.as_str(), account_id))
+        }
+        AuthData::ApiKey { .. } => anyhow::bail!("Account is not using ChatGPT OAuth"),
+    }
+}
+
 async fn send_chatgpt_usage_request(
     access_token: &str,
     chatgpt_account_id: Option<&str>,
@@ -260,6 +371,21 @@ async fn send_chatgpt_usage_request(
         .send()
         .await
         .context("Failed to send usage request")
+}
+
+async fn send_chatgpt_account_metadata_request(
+    access_token: &str,
+    chatgpt_account_id: &str,
+) -> Result<reqwest::Response> {
+    let client = reqwest::Client::new();
+    let headers = build_chatgpt_headers(access_token, Some(chatgpt_account_id))?;
+
+    client
+        .get(CHATGPT_ACCOUNTS_CHECK_API)
+        .headers(headers)
+        .send()
+        .await
+        .context("Failed to send ChatGPT account metadata request")
 }
 
 async fn send_chatgpt_warmup_request(
@@ -445,8 +571,59 @@ pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_payload_to_usage_info, get_account_usage};
+    use super::{
+        convert_payload_to_usage_info, extract_chatgpt_account_metadata, get_account_usage,
+        AccountsCheckResponse,
+    };
     use crate::types::{RateLimitStatusPayload, StoredAccount};
+
+    #[test]
+    fn extracts_subscription_metadata_for_the_exact_requested_account() {
+        let payload: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "default": {
+                    "account": { "plan_type": "free" },
+                    "entitlement": { "expires_at": "2030-01-01T00:00:00Z" }
+                },
+                "acct-target": {
+                    "account": { "plan_type": "plus" },
+                    "entitlement": { "expires_at": "2026-09-12T05:30:00Z" }
+                }
+            }
+        }))
+        .expect("valid account metadata payload");
+
+        let metadata = extract_chatgpt_account_metadata(&payload, "acct-target")
+            .expect("target account metadata");
+
+        assert_eq!(metadata.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            metadata
+                .subscription_expires_at
+                .map(|value| value.to_rfc3339()),
+            Some("2026-09-12T05:30:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_metadata_for_a_different_account() {
+        let payload: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "default": {
+                    "account": { "plan_type": "plus" },
+                    "entitlement": { "expires_at": "2026-09-12T05:30:00Z" }
+                }
+            }
+        }))
+        .expect("valid account metadata payload");
+
+        let error = extract_chatgpt_account_metadata(&payload, "acct-target")
+            .expect_err("metadata from another account must not be accepted");
+
+        assert!(error
+            .to_string()
+            .contains("did not include the requested account"));
+    }
 
     #[test]
     fn truncates_multibyte_text_without_panicking() {

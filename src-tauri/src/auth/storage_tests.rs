@@ -485,3 +485,32 @@ fn concurrent_catalog_mutations_do_not_lose_changes() {
     assert_eq!(store.accounts[0].name, "Renamed");
     assert_eq!(store.masked_account_ids, vec![account_id]);
 }
+
+#[test]
+fn subscription_metadata_update_persists_the_verified_entitlement() {
+    let _guard = crate::test_support::env_lock();
+    let _env = TestEnv::new();
+
+    let stored =
+        add_account(chatgpt_account("Subscriber", "subscription")).expect("add ChatGPT account");
+    let expires_at = "2026-09-12T05:30:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("valid expiry timestamp");
+
+    update_account_subscription_metadata(&stored.id, Some("pro".to_string()), Some(expires_at))
+        .expect("persist subscription metadata");
+
+    let updated = get_account(&stored.id)
+        .expect("load account")
+        .expect("account exists");
+    assert_eq!(updated.plan_type.as_deref(), Some("pro"));
+    assert_eq!(updated.subscription_expires_at, Some(expires_at));
+
+    update_account_subscription_metadata(&stored.id, None, None)
+        .expect("clear an entitlement omitted by a successful response");
+    let cleared = get_account(&stored.id)
+        .expect("reload account")
+        .expect("account exists");
+    assert_eq!(cleared.plan_type.as_deref(), Some("pro"));
+    assert!(cleared.subscription_expires_at.is_none());
+}

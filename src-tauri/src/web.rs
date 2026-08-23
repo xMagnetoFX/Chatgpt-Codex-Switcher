@@ -16,8 +16,9 @@ use crate::commands::{
     complete_login, delete_account, export_accounts_full_encrypted_bytes,
     export_accounts_slim_text, get_active_account_info, get_masked_account_ids, get_usage,
     import_accounts_full_encrypted_bytes, import_accounts_slim_text, list_accounts,
-    refresh_all_accounts_usage, rename_account, restart_codex_and_switch_account,
-    set_masked_account_ids, start_login, switch_account, warmup_account, warmup_all_accounts,
+    refresh_account_metadata, refresh_all_accounts_usage, rename_account,
+    restart_codex_and_switch_account, set_masked_account_ids, start_login, switch_account,
+    warmup_account, warmup_all_accounts,
 };
 
 const BASIC_AUTH_REALM: &str = "ChatGPT Codex Switcher";
@@ -225,6 +226,10 @@ async fn invoke_web_command(command: &str, payload: Value) -> Result<Value, Stri
         "get_usage" => {
             let args: AccountIdArgs = parse_args(payload)?;
             to_json(get_usage(args.account_id).await?)
+        }
+        "refresh_account_metadata" => {
+            let args: AccountIdArgs = parse_args(payload)?;
+            to_json(refresh_account_metadata(args.account_id).await?)
         }
         "refresh_all_accounts_usage" => to_json(refresh_all_accounts_usage().await?),
         "warmup_account" => {

@@ -9,6 +9,7 @@ const baseAccount: AccountWithUsage = {
   name: "AC3 Private",
   email: "private@example.com",
   plan_type: "plus",
+  subscription_expires_at: null,
   auth_mode: "chat_gpt",
   is_active: false,
   created_at: "2026-04-20T00:00:00Z",
@@ -71,6 +72,30 @@ describe("AccountCard", () => {
 
     expect(screen.getByText("Pro")).toBeInTheDocument();
     expect(screen.queryByText("Plus")).not.toBeInTheDocument();
+  });
+
+  it("shows the verified subscription date in both card layouts", () => {
+    const account = {
+      ...baseAccount,
+      subscription_expires_at: "2099-12-31T00:00:00Z",
+    };
+
+    renderCard({ account });
+    renderCard({ account, featured: true });
+
+    expect(screen.getAllByText(/Active until .*2099/)).toHaveLength(2);
+  });
+
+  it("does not show subscription metadata for API key accounts", () => {
+    renderCard({
+      account: {
+        ...baseAccount,
+        auth_mode: "api_key",
+        subscription_expires_at: "2099-12-31T00:00:00Z",
+      },
+    });
+
+    expect(screen.queryByText(/Active until/)).not.toBeInTheDocument();
   });
 
   it("locks switching while Codex runs when restart switching is disabled", () => {

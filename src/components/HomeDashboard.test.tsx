@@ -25,6 +25,7 @@ function makeAccount(id: string, name: string, email: string, isActive = false):
     name,
     email,
     plan_type: "plus",
+    subscription_expires_at: null,
     auth_mode: "chat_gpt",
     is_active: isActive,
     created_at: "2026-04-20T00:00:00Z",

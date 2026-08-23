@@ -45,6 +45,9 @@ pub struct StoredAccount {
     pub email: Option<String>,
     /// Plan type: free, plus, pro, team, business, enterprise, edu
     pub plan_type: Option<String>,
+    /// End of the last verified ChatGPT subscription entitlement period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_expires_at: Option<DateTime<Utc>>,
     /// Authentication mode
     pub auth_mode: AuthMode,
     /// Authentication credentials
@@ -68,6 +71,7 @@ impl StoredAccount {
             name,
             email: None,
             plan_type: None,
+            subscription_expires_at: None,
             auth_mode: AuthMode::ApiKey,
             auth_data: AuthData::ApiKey { key: api_key },
             created_at: Utc::now(),
@@ -115,6 +119,7 @@ impl StoredAccount {
             name,
             email,
             plan_type,
+            subscription_expires_at: None,
             auth_mode: AuthMode::ChatGPT,
             auth_data: AuthData::ChatGPT {
                 id_token,
@@ -204,6 +209,7 @@ mod tests {
         assert_eq!(store.active_account_id.as_deref(), Some("legacy-1"));
         assert_eq!(store.accounts.len(), 1);
         assert_eq!(store.accounts[0].auth_mode, AuthMode::ChatGPT);
+        assert!(store.accounts[0].subscription_expires_at.is_none());
         assert!(matches!(
             store.accounts[0].auth_data,
             AuthData::ChatGPT {
@@ -264,6 +270,7 @@ pub struct AccountInfo {
     pub name: String,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    pub subscription_expires_at: Option<DateTime<Utc>>,
     pub auth_mode: AuthMode,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
@@ -277,6 +284,7 @@ impl AccountInfo {
             name: account.name.clone(),
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_expires_at: account.subscription_expires_at,
             auth_mode: account.auth_mode,
             is_active: active_id == Some(&account.id),
             created_at: account.created_at,

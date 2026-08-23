@@ -8,6 +8,7 @@ function makeAccount(overrides: Partial<AccountWithUsage> = {}): AccountWithUsag
     name: "API account",
     email: null,
     plan_type: "api_key",
+    subscription_expires_at: null,
     auth_mode: "api_key",
     is_active: false,
     created_at: "2026-04-20T00:00:00Z",

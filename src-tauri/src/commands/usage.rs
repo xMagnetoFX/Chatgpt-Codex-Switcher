@@ -1,9 +1,12 @@
 //! Usage query Tauri commands
 
-use crate::api::usage::{get_account_usage, refresh_all_usage, warmup_account as send_warmup};
-use crate::auth::storage::update_account_metadata;
+use crate::api::usage::{
+    get_account_usage, get_chatgpt_account_metadata, refresh_all_usage,
+    warmup_account as send_warmup,
+};
+use crate::auth::storage::{update_account_metadata, update_account_subscription_metadata};
 use crate::auth::{get_account, load_accounts};
-use crate::types::{StoredAccount, UsageInfo, WarmupSummary};
+use crate::types::{AccountInfo, AuthData, StoredAccount, UsageInfo, WarmupSummary};
 use futures::{stream, StreamExt};
 
 /// Get usage info for a specific account
@@ -18,6 +21,36 @@ pub async fn get_usage(account_id: String) -> Result<UsageInfo, String> {
         .map_err(|e| e.to_string())?;
     persist_live_plan_type(&account, &usage);
     Ok(usage)
+}
+
+/// Refresh the current ChatGPT plan and entitlement date for one account.
+/// API key accounts have no ChatGPT subscription metadata and are returned unchanged.
+#[tauri::command]
+pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo, String> {
+    let account = get_account(&account_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+
+    let updated = match &account.auth_data {
+        AuthData::ApiKey { .. } => account,
+        AuthData::ChatGPT { .. } => {
+            let metadata = get_chatgpt_account_metadata(&account)
+                .await
+                .map_err(|error| error.to_string())?;
+            update_account_subscription_metadata(
+                &account_id,
+                metadata.plan_type,
+                metadata.subscription_expires_at,
+            )
+            .map_err(|error| error.to_string())?
+        }
+    };
+
+    let store = load_accounts().map_err(|error| error.to_string())?;
+    Ok(AccountInfo::from_stored(
+        &updated,
+        store.active_account_id.as_deref(),
+    ))
 }
 
 /// Refresh usage info for all accounts

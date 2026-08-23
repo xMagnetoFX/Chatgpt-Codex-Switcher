@@ -14,6 +14,10 @@ function resolvePlanType(usage: UsageInfo, fallback: string | null): string | nu
   return livePlanType || fallback;
 }
 
+interface RefreshUsageOptions {
+  refreshMetadata?: boolean;
+}
+
 export function useAccounts() {
   const [accounts, setAccounts] = useState<AccountWithUsage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -99,12 +103,40 @@ export function useAccounts() {
     }
   }, []);
 
+  const refreshAccountMetadata = useCallback(
+    async (accountList: AccountInfo[] | AccountWithUsage[]) => {
+      const chatGptAccounts = accountList.filter((account) => account.auth_mode === "chat_gpt");
+      if (chatGptAccounts.length === 0) return accountList;
+
+      await runWithConcurrency(
+        chatGptAccounts,
+        async (account) => {
+          try {
+            await invokeBackend<AccountInfo>("refresh_account_metadata", {
+              accountId: account.id,
+            });
+          } catch (err) {
+            console.warn("Failed to refresh optional subscription metadata:", err);
+          }
+        },
+        maxConcurrentUsageRequests
+      );
+
+      return loadAccounts(true);
+    },
+    [loadAccounts, maxConcurrentUsageRequests, runWithConcurrency]
+  );
+
   const refreshUsage = useCallback(
-    async (accountList?: AccountInfo[] | AccountWithUsage[]) => {
+    async (accountList?: AccountInfo[] | AccountWithUsage[], options?: RefreshUsageOptions) => {
       try {
-        const list = accountList ?? accountsRef.current;
+        let list = accountList ?? accountsRef.current;
         if (list.length === 0) {
           return;
+        }
+
+        if (options?.refreshMetadata) {
+          list = await refreshAccountMetadata(list);
         }
 
         const accountIds = list.map((account) => account.id);
@@ -154,14 +186,16 @@ export function useAccounts() {
         throw err;
       }
     },
-    [buildUsageError, maxConcurrentUsageRequests, runWithConcurrency]
+    [buildUsageError, maxConcurrentUsageRequests, refreshAccountMetadata, runWithConcurrency]
   );
 
   const reloadAfterMutation = useCallback(
     async (preserveUsage = false, refreshLoadedUsage = false) => {
       try {
         const accountList = await loadAccounts(preserveUsage);
-        if (refreshLoadedUsage) await refreshUsage(accountList);
+        if (refreshLoadedUsage) {
+          await refreshUsage(accountList, { refreshMetadata: true });
+        }
       } catch (err) {
         console.error("The account change succeeded, but reloading the account list failed:", err);
       }
@@ -394,7 +428,7 @@ export function useAccounts() {
 
   useEffect(() => {
     loadAccounts()
-      .then((accountList) => refreshUsage(accountList))
+      .then((accountList) => refreshUsage(accountList, { refreshMetadata: true }))
       .catch((err) => {
         console.error("Failed to load initial usage:", err);
       });

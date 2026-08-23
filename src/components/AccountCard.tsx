@@ -28,6 +28,25 @@ function formatLastRefresh(date: Date | null): string {
   return date.toLocaleDateString();
 }
 
+function formatSubscriptionExpiry(timestamp: string | null): {
+  label: string;
+  isPast: boolean;
+} | null {
+  if (!timestamp) return null;
+
+  const expiry = new Date(timestamp);
+  if (Number.isNaN(expiry.getTime())) return null;
+
+  return {
+    label: `Active until ${new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    }).format(expiry)}`,
+    isPast: expiry.getTime() <= Date.now(),
+  };
+}
+
 function PrivateText({
   children,
   masked,
@@ -131,6 +150,10 @@ export function AccountCard({
     resolvedPlanType?.toLowerCase() || (account.auth_mode === "api_key" ? "api_key" : "unknown");
   const planLabel = formatPlanLabel({ ...account, plan_type: resolvedPlanType });
   const chipClass = planChipClass[planKey] ?? planChipClass.free;
+  const subscriptionExpiry =
+    account.auth_mode === "chat_gpt"
+      ? formatSubscriptionExpiry(account.subscription_expires_at)
+      : null;
   const switchIsLocked = Boolean(switchDisabled && !restartSwitchEnabled);
 
   if (isFeatured) {
@@ -190,6 +213,11 @@ export function AccountCard({
 
           <div className="plan-row">
             <span className={chipClass}>{planLabel}</span>
+            {subscriptionExpiry && (
+              <span className={`plan-expiry ${subscriptionExpiry.isPast ? "is-past" : ""}`}>
+                {subscriptionExpiry.label}
+              </span>
+            )}
           </div>
 
           <div className="featured-cta">
@@ -280,7 +308,14 @@ export function AccountCard({
             )}
           </div>
         </div>
-        <span className={chipClass}>{planLabel}</span>
+        <div className="acct-card-plan">
+          <span className={chipClass}>{planLabel}</span>
+          {subscriptionExpiry && (
+            <span className={`plan-expiry ${subscriptionExpiry.isPast ? "is-past" : ""}`}>
+              {subscriptionExpiry.label}
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="usage-block">

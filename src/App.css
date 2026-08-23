@@ -1088,6 +1088,17 @@ textarea {
   border-style: dashed;
 }
 
+.plan-expiry {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.plan-expiry.is-past {
+  color: var(--danger);
+}
+
 /* =========================================================
    STANDBY ACCOUNT CARDS
    ========================================================= */
@@ -1137,6 +1148,14 @@ textarea {
   align-items: flex-start;
   gap: 12px;
   justify-content: space-between;
+}
+
+.acct-card-plan {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex-shrink: 0;
+  gap: 5px;
 }
 
 .acct-card-identity {

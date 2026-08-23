@@ -21,6 +21,7 @@ function account(id: string, isActive: boolean): AccountInfo {
     name: id,
     email: `${id}@example.com`,
     plan_type: "plus",
+    subscription_expires_at: null,
     auth_mode: "chat_gpt",
     is_active: isActive,
     created_at: "2026-07-30T00:00:00Z",
@@ -36,6 +37,24 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function usage(accountId: string) {
+  return {
+    account_id: accountId,
+    plan_type: "plus",
+    primary_used_percent: 10,
+    primary_window_minutes: 300,
+    primary_resets_at: 1_800_000_000,
+    secondary_used_percent: 20,
+    secondary_window_minutes: 10_080,
+    secondary_resets_at: 1_800_086_400,
+    has_credits: false,
+    unlimited_credits: false,
+    credits_balance: null,
+    banked_resets: 0,
+    error: null,
+  };
 }
 
 beforeEach(() => {
@@ -112,6 +131,58 @@ describe("useAccounts", () => {
 
     expect(caught).toBe(mutationError);
     expect(result.current.accounts.map((entry) => entry.id)).toEqual(["saved"]);
+    unmount();
+  });
+
+  it("preserves cached subscription metadata when its optional refresh fails", async () => {
+    const cachedAccount = {
+      ...account("subscriber", true),
+      subscription_expires_at: "2026-09-12T05:30:00Z",
+    };
+    invokeBackendMock.mockImplementation((command: string) => {
+      if (command === "list_accounts") return Promise.resolve([cachedAccount]);
+      if (command === "refresh_account_metadata") {
+        return Promise.reject(new Error("metadata unavailable"));
+      }
+      if (command === "get_usage") return Promise.resolve(usage("subscriber"));
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { result, unmount } = renderHook(() => useAccounts());
+    await waitFor(() => expect(result.current.accounts[0]?.usage?.primary_used_percent).toBe(10));
+
+    expect(result.current.accounts[0].subscription_expires_at).toBe("2026-09-12T05:30:00Z");
+    expect(result.current.accounts[0].usage?.primary_used_percent).toBe(10);
+    unmount();
+  });
+
+  it("loads newly verified subscription metadata during startup refresh", async () => {
+    let metadataRefreshed = false;
+    invokeBackendMock.mockImplementation((command: string) => {
+      if (command === "list_accounts") {
+        return Promise.resolve([
+          {
+            ...account("subscriber", true),
+            subscription_expires_at: metadataRefreshed ? "2026-10-15T05:30:00Z" : null,
+          },
+        ]);
+      }
+      if (command === "refresh_account_metadata") {
+        metadataRefreshed = true;
+        return Promise.resolve(account("subscriber", true));
+      }
+      if (command === "get_usage") return Promise.resolve(usage("subscriber"));
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { result, unmount } = renderHook(() => useAccounts());
+    await waitFor(() =>
+      expect(result.current.accounts[0]?.subscription_expires_at).toBe("2026-10-15T05:30:00Z")
+    );
+
+    expect(invokeBackendMock).toHaveBeenCalledWith("refresh_account_metadata", {
+      accountId: "subscriber",
+    });
     unmount();
   });
 });

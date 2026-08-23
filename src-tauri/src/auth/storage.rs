@@ -435,6 +435,34 @@ pub fn update_account_metadata(
     })
 }
 
+/// Persist the latest subscription metadata returned for a ChatGPT account.
+///
+/// A successful response with no expiry clears a previously cached entitlement date. Callers
+/// must not invoke this function when the metadata request itself failed.
+pub fn update_account_subscription_metadata(
+    account_id: &str,
+    plan_type: Option<String>,
+    subscription_expires_at: Option<DateTime<Utc>>,
+) -> Result<StoredAccount> {
+    mutate_store(|store| {
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .context("Account not found")?;
+
+        if matches!(&account.auth_data, AuthData::ApiKey { .. }) {
+            anyhow::bail!("Cannot update ChatGPT subscription metadata for an API key account");
+        }
+
+        if let Some(plan_type) = plan_type {
+            account.plan_type = Some(plan_type);
+        }
+        account.subscription_expires_at = subscription_expires_at;
+        Ok(account.clone())
+    })
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ChatGptCredentialFingerprint([u8; 32]);
 

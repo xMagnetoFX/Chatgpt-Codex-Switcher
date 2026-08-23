@@ -356,7 +356,7 @@ function App() {
     setIsRefreshing(true);
     setRefreshSuccess(false);
     try {
-      await refreshUsage();
+      await refreshUsage(undefined, { refreshMetadata: true });
       setRefreshSuccess(true);
       window.setTimeout(() => setRefreshSuccess(false), 2000);
     } catch (err) {
@@ -372,7 +372,7 @@ function App() {
     setRefreshSuccess(false);
     try {
       const accountList = await loadAccounts();
-      await refreshUsage(accountList);
+      await refreshUsage(accountList, { refreshMetadata: true });
       setRefreshSuccess(true);
       window.setTimeout(() => setRefreshSuccess(false), 2000);
     } catch (err) {
@@ -539,7 +539,7 @@ function App() {
       const summary = await importFullBackupFile();
       if (!summary) return;
       const accountList = await loadAccounts();
-      await refreshUsage(accountList);
+      await refreshUsage(accountList, { refreshMetadata: true });
       const maskedIds = await loadMaskedAccountIds();
       setMaskedAccounts(new Set(maskedIds));
       showWarmupToast(
