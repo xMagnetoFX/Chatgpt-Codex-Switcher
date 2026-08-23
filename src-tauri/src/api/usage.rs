@@ -137,10 +137,14 @@ fn extract_chatgpt_account_metadata(
     payload: &AccountsCheckResponse,
     chatgpt_account_id: &str,
 ) -> Result<ChatGptAccountMetadata> {
-    let entry = payload
-        .accounts
-        .get(chatgpt_account_id)
-        .context("ChatGPT account metadata response did not include the requested account")?;
+    let entry = payload.accounts.get(chatgpt_account_id).or_else(|| {
+        if payload.accounts.len() != 1 {
+            return None;
+        }
+        payload.accounts.get("default")
+    });
+    let entry =
+        entry.context("ChatGPT account metadata response did not include the requested account")?;
 
     Ok(ChatGptAccountMetadata {
         plan_type: entry
@@ -609,7 +613,7 @@ mod tests {
     fn rejects_metadata_for_a_different_account() {
         let payload: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
             "accounts": {
-                "default": {
+                "acct-other": {
                     "account": { "plan_type": "plus" },
                     "entitlement": { "expires_at": "2026-09-12T05:30:00Z" }
                 }
@@ -619,6 +623,54 @@ mod tests {
 
         let error = extract_chatgpt_account_metadata(&payload, "acct-target")
             .expect_err("metadata from another account must not be accepted");
+
+        assert!(error
+            .to_string()
+            .contains("did not include the requested account"));
+    }
+
+    #[test]
+    fn accepts_a_sole_default_account_entry() {
+        let payload: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "default": {
+                    "account": { "plan_type": "plus" },
+                    "entitlement": { "expires_at": "2026-09-12T05:30:00Z" }
+                }
+            }
+        }))
+        .expect("valid default account metadata payload");
+
+        let metadata = extract_chatgpt_account_metadata(&payload, "acct-target")
+            .expect("a sole default entry belongs to the authenticated account");
+
+        assert_eq!(metadata.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            metadata
+                .subscription_expires_at
+                .map(|value| value.to_rfc3339()),
+            Some("2026-09-12T05:30:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_default_fallback_when_multiple_accounts_are_returned() {
+        let payload: AccountsCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "default": {
+                    "account": { "plan_type": "plus" },
+                    "entitlement": { "expires_at": "2026-09-12T05:30:00Z" }
+                },
+                "acct-other": {
+                    "account": { "plan_type": "pro" },
+                    "entitlement": { "expires_at": "2026-10-15T05:30:00Z" }
+                }
+            }
+        }))
+        .expect("valid multi-account metadata payload");
+
+        let error = extract_chatgpt_account_metadata(&payload, "acct-target")
+            .expect_err("a default entry is ambiguous when other accounts are present");
 
         assert!(error
             .to_string()
